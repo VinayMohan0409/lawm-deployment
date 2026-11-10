@@ -1,0 +1,199 @@
+{
+ "args": {
+  "ablation_windows": 1000,
+  "ada_weight_init_std": 0.02,
+  "amp": true,
+  "config": "/lus/lfs1aip2/scratch/u6tc/vinay.u6tc/latent-action-world-model/configs/h2o_50pct.json",
+  "contrastive_lambda": 0.15,
+  "contrastive_tau": 0.1,
+  "decoder_self_attention": "adaln",
+  "determinism": "strict",
+  "drop_path": 0.3,
+  "epochs": 1,
+  "final_ablation_windows": 4000,
+  "grad_clip": 5.0,
+  "k": 4,
+  "lr": 0.0001,
+  "m": 2,
+  "max_steps": 0,
+  "n_queries": 4,
+  "prepare_only": false,
+  "print_every": 50,
+  "profile_steps": 0,
+  "results_root": "/lus/lfs1aip2/scratch/u6tc/vinay.u6tc/latent-action-world-model/results",
+  "resume": false,
+  "run_name": "adaln_s0_k4",
+  "runs_root": null,
+  "save_every": 500,
+  "seed": 0,
+  "shuffle_orders": true,
+  "val_batch_size": 8,
+  "val_windows": 0,
+  "voxel_dedup": true,
+  "weight_decay": 0.01,
+  "workers": 8,
+  "z_dim": 8
+ },
+ "command": [
+  "/lus/lfs1aip2/projects/public/u6tc/vinay/public_data/transfer_to_u6ph/envs/utonia/bin/python",
+  "scripts/train_chunked.py",
+  "--run-name",
+  "adaln_s0_k4",
+  "--decoder-self-attention",
+  "adaln",
+  "--epochs",
+  "1",
+  "--seed",
+  "0",
+  "--save-every",
+  "500"
+ ],
+ "config": {
+  "centring": "mean of all points of the embodiment's own frame 0, no segment labels",
+  "checkpoint_selection": "validation only (no test set)",
+  "data_dir": "training_data/h2o_cross_embodiment_pointclouds",
+  "dataset": "h2o",
+  "embodiments": {
+   "held_out": [],
+   "names": [
+    "human",
+    "ability",
+    "allegro",
+    "inspire",
+    "leap",
+    "oymotion",
+    "shadow",
+    "wuji",
+    "xhand"
+   ],
+   "train_on": "all"
+  },
+  "normalisation": {
+   "embodiments": "all",
+   "seed": 0,
+   "split": "train",
+   "static_points_counted_as_zero": true,
+   "windows": 4000
+  },
+  "points_note": "hands keep every stored point (2048 = 1024 per hand); object, table and each distractor keep every second stored point (2048 -> 1024); 0 = every stored point",
+  "split_file": "splits/h2o_50pct.json",
+  "variant": "50pct",
+  "voxel_note": "no data-layer voxel reduction (voxel_size 0.0): every point is kept and predicted; the backbone sees one point per 5 mm voxel in every frame through the voxel_dedup wrapper and every point takes its voxel's features",
+  "window": {
+   "gap": 6,
+   "n_steps": 5,
+   "points_per_embodiment_hand": 2048,
+   "points_per_entity": 1024,
+   "voxel_size": 0.0
+  }
+ },
+ "config_file": "/lus/lfs1aip2/scratch/u6tc/vinay.u6tc/latent-action-world-model/configs/h2o_50pct.json",
+ "config_sha256": "c686f20dc80df4dcb3e5b98575e3c8a11f6e883e2887291d90a94a2f416afc11",
+ "data": {
+  "ablation_windows": 1000,
+  "dataset_dir": "/lus/lfs1aip2/projects/public/u6tc/lawm/data/training_data/h2o_cross_embodiment_pointclouds",
+  "points_per_entity": 1024,
+  "train_fingerprint": "9c43c4d581b2d2742687eeeb5413609fb51a59d51f0fc92a4888fde87065bc7b",
+  "train_windows": 41094,
+  "val_windows": 8465
+ },
+ "determinism": {
+  "cudnn_benchmark": false,
+  "cudnn_deterministic": true,
+  "deterministic_algorithms": true,
+  "mode": "strict",
+  "tf32_cudnn": true,
+  "tf32_matmul": false,
+  "warn_only": false
+ },
+ "environment": {
+  "cuda": "12.4",
+  "cudnn": 90100,
+  "driver": "580.178.04",
+  "git_commit": "18c69b4161a2f87eb52e6614ef1b59e436f6cd4d",
+  "git_diff_sha256": "5469ed301f1cb44119194b012d3bd97c53f63dc2ad097908305e5279300c6ba5",
+  "git_dirty": true,
+  "gpu": "NVIDIA GH200 120GB",
+  "gpus_visible": 4,
+  "node": "nid010866",
+  "numerics_env": {
+   "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+   "LAWM_BUILD_LOCK": "/tmp/lawm_7636001/spconv_build.lock",
+   "LAWM_DATA_ROOT": "/lus/lfs1aip2/projects/public/u6tc/lawm/data",
+   "NCCL_ALGO": "Ring",
+   "NCCL_PROTO": null,
+   "OMP_NUM_THREADS": "1",
+   "PYTHONHASHSEED": null,
+   "SPCONV_ALGO_TIME_LIMIT": null,
+   "SPCONV_DEBUG_SAVE_PATH": null,
+   "TORCH_CUDNN_V8_API_ENABLED": null
+  },
+  "packages": {
+   "numpy": "1.26.4",
+   "timm": "1.0.27",
+   "torch": "2.5.0",
+   "torch-scatter": "2.1.2"
+  },
+  "platform": "Linux-6.4.0-150700.53.81-64kb-aarch64-with-glibc2.38",
+  "python": "3.10.20 | packaged by conda-forge | (main, Jun 11 2026, 03:25:23) [GCC 14.3.0]",
+  "slurm": {
+   "SLURM_CPUS_PER_TASK": "96",
+   "SLURM_GPUS_ON_NODE": "4",
+   "SLURM_JOB_ID": "7636001",
+   "SLURM_JOB_NODELIST": "nid010866",
+   "SLURM_JOB_PARTITION": "workq",
+   "SLURM_NTASKS": "1"
+  }
+ },
+ "run": {
+  "device": "cuda:0",
+  "parameters": 8607063,
+  "ptv3_config": {
+   "drop_path": 0.3,
+   "enable_flash": false,
+   "enc_channels": [
+    48,
+    96,
+    144,
+    192
+   ],
+   "enc_depths": [
+    2,
+    2,
+    3,
+    2
+   ],
+   "enc_mode": true,
+   "enc_num_head": [
+    2,
+    4,
+    6,
+    8
+   ],
+   "enc_patch_size": [
+    1024,
+    1024,
+    1024,
+    1024
+   ],
+   "in_channels": 3,
+   "order": [
+    "z",
+    "z-trans"
+   ],
+   "shuffle_orders": true,
+   "stride": [
+    2,
+    2,
+    2
+   ]
+  },
+  "steps_per_epoch": 2568,
+  "windows_per_gpu_step": 8,
+  "windows_per_step": 32,
+  "world_size": 4
+ },
+ "split_sha256": "978e6c40df92f9da0a3e91cf15b5f46e31fec52c27d018aa03a442356707bbe2",
+ "stats_file": "/lus/lfs1aip2/projects/public/u6tc/lawm/runs/_cache/norm_stats_train_9c43c4d581b2_g6_n5_p1024_v0_w4000_s0.npz",
+ "stats_sha256": "710a513da558418d53fdfece0831d9cf29919d253cfc11cfb841e31dcc65bc7f"
+}

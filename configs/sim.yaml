@@ -6,6 +6,8 @@ model:
   checkpoint: checkpoint/best.pt
   manifest: checkpoint/run_manifest.json
   prior: checkpoint/prior.npz
+  training_up: [-0.022, -0.546, -0.837]   # "up" (table towards hands) in the training data's frame: mean of 200 training windows
+  spin_deg: 315                           # base-frame horizontal direction mapped to the training x axis (chosen in sim: most static scene)
 
 mount: {xyz_m: [0.0, 0.0, 0.0], rpy_deg: [0.0, 0.0, 0.0]}   # hand MJCF origin in the flange frame
 
@@ -24,6 +26,7 @@ cell:
   cameras:
     cam_left: {eye: [0.95, -0.45, 0.6], target: [0.5, 0.15, 0.05]}
     cam_right: {eye: [0.95, 0.75, 0.6], target: [0.5, 0.15, 0.05]}
+  video: {eye: [1.45, -0.7, 0.95], target: [0.35, 0.12, 0.2], fovy_deg: 45, width: 640, height: 480, fps: 20}   # recording camera (sim only)
   motion: {speed: 0.1, accel: 0.5, rot_speed: 0.5, finger_speed: 1.0, min_move_s: 0.3, finger_rate_hz: 100, settle_s: 0.2}
 
 perception:
@@ -60,6 +63,6 @@ planner:
   gates:
     hover: {margin_mm: 200.0, proximity_mm: 50.0, replan_cap: 40}
 
-loop:
-  reach: {max_replans: 80, converge_mm: 10.0, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
-  grasp: {max_replans: 80, converge_mm: 10.0, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}
+loop:   # success: hand within success_mm of the goal hand for success_replans replans in a row
+  reach: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
+  grasp: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}

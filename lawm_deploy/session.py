@@ -26,10 +26,11 @@ TASKS = ("reach", "grasp")  # place needs object labels, which real camera cloud
 
 @dataclass(frozen=True)
 class LoopSettings:
-    """When a run stops: replan cap, measured task distance that counts as done (mm), stall patience (None = off) and tolerance (mm), and how many held replans in a row end it."""
+    """When a run stops: replan cap, success (distance under success_mm for success_replans replans in a row), stall patience (None = off) and tolerance (mm), and how many held replans in a row end it."""
 
     max_replans: int
-    converge_mm: float
+    success_mm: float
+    success_replans: int
     stall_patience: int | None
     stall_tol_mm: float
     max_holds: int
@@ -66,7 +67,7 @@ class Session:
     """Goal, start and the replan loop of one experiment on one cell (real or simulated) with one model."""
 
     def __init__(self, cell, cfg, model, log_root):
-        """Build the robot model, the hand cloud and perception; every capture and replan is written under log_root/<time>."""
+        """Build the robot model, the hand cloud and perception; captures go to log_root/<time>, each run to its own folder inside it."""
         self.cell, self.cfg, self.model = cell, cfg, model
         self.robot = RobotModel(mount_pose(cfg), seed=cfg["seed"])
         self.hand = Hand(self.robot.model, cfg["perception"]["n_hand"], cfg["seed"])
@@ -74,7 +75,7 @@ class Session:
         self.safety = SafetySettings(**cfg["safety"])
         self.log = Path(log_root) / time.strftime("%Y%m%d_%H%M%S")
         self.log.mkdir(parents=True, exist_ok=True)
-        self.goal = self.current = self.planner = self.last_plan = None
+        self.goal = self.start = self.current = self.planner = self.last_plan = self.run_dir = None
         self.task, self.replan, self.holds, self.records = None, 0, 0, []
 
     def observe(self):
@@ -85,26 +86,28 @@ class Session:
         coords, segment, info = self.perception(views, self.robot.surface(q_arm, q_hand), self.hand.points(root, q_hand))
         return Observation(coords, segment, q_arm, q_hand, flange, root, views, info)
 
-    def save(self, name, obs, **extra):
-        """Write an observation (depth in mm as uint16) and extra arrays to log/name.npz."""
+    def save(self, name, obs, folder=None, **extra):
+        """Write an observation (depth in mm as uint16) and extra arrays to folder/name.npz (default: the session folder)."""
         depths = {f"depth_{i}": np.round(d * 1000).clip(0, 65535).astype(np.uint16) for i, (d, _, _) in enumerate(obs.views)}
         cams = {f"cam_{i}": np.concatenate([K.ravel(), T.ravel()]) for i, (_, K, T) in enumerate(obs.views)}
-        np.savez_compressed(self.log / f"{name}.npz", coords=obs.coords, segment=obs.segment, q_arm=obs.q_arm, q_hand=obs.q_hand, flange=obs.flange, **depths, **cams, **extra)
+        np.savez_compressed(Path(folder or self.log) / f"{name}.npz", coords=obs.coords, segment=obs.segment, q_arm=obs.q_arm, q_hand=obs.q_hand, flange=obs.flange, **depths, **cams, **extra)
 
     def capture_goal(self):
         """Observe and keep it as the goal (the robot and the object arranged as they should end up)."""
         self.goal = self.observe()
         self.save("goal", self.goal)
+        if hasattr(self.cell, "set_markers"):  # simulated cell: draw the goal hand in the video
+            self.cell.set_markers(self.goal.coords[self.goal.segment == SEG_HAND])
         return self.goal
 
     def capture_start(self):
         """Observe and keep it as the start."""
-        self.current = self.observe()
+        self.start = self.current = self.observe()
         self.save("start", self.current)
         return self.current
 
     def begin(self, task):
-        """Set up the planner of a task on the captured goal and start."""
+        """Set up the planner of a task on the captured goal and start, in a new run folder holding copies of both."""
         assert task in TASKS, task
         assert self.goal is not None and self.current is not None, "capture the goal, then the start"
         cem, weights, gates = planner_settings(self.cfg, task)
@@ -113,8 +116,14 @@ class Session:
         self.executor = Executor(self.safety, self.current.flange)
         self.loop = LoopSettings(**self.cfg["loop"][task])
         self.stall = None if self.loop.stall_patience is None else StallDetector(self.loop.stall_patience, self.loop.stall_tol_mm)
-        self.task, self.replan, self.holds, self.records = task, 0, 0, []
-        (self.log / "run.json").write_text(json.dumps(dict(task=task, seed=seed, config=self.cfg), indent=1))
+        self.task, self.replan, self.holds, self.within, self.records = task, 0, 0, 0, []
+        self.run_dir = self.log / f"{time.strftime('%H%M%S')}_{task}"
+        self.run_dir.mkdir()
+        (self.run_dir / "run.json").write_text(json.dumps(dict(task=task, seed=seed, config=self.cfg), indent=1))
+        self.save("goal", self.goal, self.run_dir)
+        self.save("start", self.current, self.run_dir)
+        if hasattr(self.cell, "start_recording"):  # simulated cell: record the run
+            self.cell.start_recording(self.run_dir / "video.mp4")
 
     def step(self, execute=True):
         """One replan: plan on the current cloud, fit the hand to predicted step 1, check, move (if execute and safe), observe; returns the record, with 'stop' set when the run should end."""
@@ -135,21 +144,34 @@ class Session:
         record = dict(replan=self.replan, distance_mm=dist, moved=moved, hold=hold, executed=plan.executed, plan_cost=plan.cost,
                       predicted_error_mm=plan.final_hand_error_mm, commanded_mm=move_mm, fit_residual_mm=fit["mean_residual_mm"], phase_changed=phase)
         self.last_plan = dict(hand_target=hand_target, commanded_hand=commanded_hand)
-        self.save(f"replan_{self.replan:03d}", obs, delta=plan.delta.astype(np.float16), target=target, fingers=fingers, hand_target=hand_target)
+        self.save(f"replan_{self.replan:03d}", obs, self.run_dir, delta=plan.delta.astype(np.float16), target=target, fingers=fingers, hand_target=hand_target)
         self.current, self.replan = new, self.replan + 1
-        record["stop"] = ("converged" if dist < self.loop.converge_mm else "too many holds" if self.holds >= self.loop.max_holds
+        self.within = self.within + 1 if dist < self.loop.success_mm else 0
+        record["within_success"] = self.within
+        record["stop"] = ("success" if self.within >= self.loop.success_replans else "too many holds" if self.holds >= self.loop.max_holds
                           else "stalled" if moved and self.stall and self.stall.update(dist) else "max replans" if self.replan >= self.loop.max_replans else None)
         self.records.append(record)
-        with open(self.log / "records.jsonl", "a") as f:
+        with open(self.run_dir / "records.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
         return record
 
     def run(self, execute=True, should_stop=lambda: False, on_step=lambda record: None):
-        """Replan until a stop condition or should_stop(); on_step sees each record."""
-        while not should_stop():
-            record = self.step(execute)
-            on_step(record)
-            if record["stop"]:
-                return record["stop"]
-        self.cell.stop()
-        return "stopped by user"
+        """Replan until a stop condition or should_stop(); on_step sees each record; the video (sim) is closed at the end."""
+        reason = "stopped by user"
+        try:
+            while not should_stop():
+                record = self.step(execute)
+                on_step(record)
+                if record["stop"]:
+                    reason = record["stop"]
+                    break
+            else:
+                self.cell.stop()
+        finally:
+            self.finish()
+        return reason
+
+    def finish(self):
+        """Close the run's video (simulated cell only)."""
+        if hasattr(self.cell, "stop_recording"):
+            self.cell.stop_recording()

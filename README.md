@@ -109,8 +109,12 @@ Open `http://localhost:8080`. With `--standin` a dummy model is used, so the ful
 
 Start the page with `python -m lawm_deploy --config configs/real.yaml` (no `--standin`), then:
 
-1. **Arrange the goal.** Put the robot where it should end: freedrive the arm and set the fingers with Sharpa Pilot. Put the objects where they should be. Then press **Capture goal**.
-2. **Arrange the start** the same way, then press **Capture start**.
+1. **Arrange the goal**, either way:
+   - **Teleoperation:** in **Arrange the robot**, tick **Teleoperation mode**. This program then releases the arm (its RTDE control script stops) and stops commanding the hand, but keeps reading the joint angles and cameras, so the live view follows the robot. Teleoperate it into place.
+   - **By hand:** tick **Freedrive** and move the arm, untick it so the arm holds, then set the fingers with the closure slider and **Set fingers**.
+
+   Put the objects where they should be, then press **Capture goal**.
+2. **Arrange the start** the same way, then press **Capture start**. If you teleoperated, untick **Teleoperation mode** before Run so this program takes control again (stop your teleop system first).
 3. **Choose the task** (`reach` or `grasp`) and press **Run**.
 
 The status line shows each replan:
@@ -118,7 +122,9 @@ The status line shows each replan:
 - whether the robot moved or held, and why it held;
 - the hand-fit error.
 
-A run ends by itself when the hand is within 10 mm of the goal, when it stalls (reach), after 5 held replans in a row, or after 80 replans. You can also press **Stop**.
+A run ends by itself with **success** when the hand stays within 5 cm (50 mm) of the goal hand for 5 replans in a row. It also ends when it stalls (reach), after 5 held replans in a row, or after 80 replans. You can also press **Stop**.
+
+**Check the model frame on the first day.** The model reads raw coordinates, so the cloud is rotated into its training data's frame before the model (`model.training_up`, `model.spin_deg`). The spin (315°) was chosen in simulation, where the table lies in front of the robot along +x. Your layout may differ. With a start captured, open **4. Check model frame** and press the button. If another spin moves the hand clearly more and the scene clearly less than the current one, set it as `model.spin_deg` in `configs/real.yaml` and restart.
 
 Optional checks before Run:
 - **Plan only:** plans once without moving. The orange points show where the hand would go.
@@ -142,7 +148,7 @@ Please send the whole `runs/` folder back.
 | `perception` | `robot_margin_m` | arm or hand points left in the cloud: raise it; object points next to the fingers lost: lower it |
 | `safety` | `floor_z_m`, `box_*`, `max_*` | the robot holds too often (the reason is shown), or is too free |
 | `planner.gates.hover.margin_mm` | 200 mm | grasp first aims this far above the goal hand; lower it if the workspace is short |
-| `loop` | `converge_mm`, `max_replans` | when a run should end |
+| `loop` | `success_mm`, `success_replans`, `max_replans` | when a run counts as a success or should end |
 
 The planner's search and cost settings are copied from lawm's `configs/stage3/dexwm.json`. Do not change them without asking.
 
@@ -159,14 +165,26 @@ Each move is limited to 60 mm. The arm moves in a straight line (`moveL`) while 
 
 ## Test in simulation (no hardware)
 
-`configs/sim.yaml` is a MuJoCo copy of the cell: the same robot, a table, two boxes and two simulated depth cameras.
+`configs/sim.yaml` is a MuJoCo copy of the cell: the same robot, a table, two boxes and two simulated depth cameras. Each run is also recorded to `video.mp4` in its run folder, with the goal hand drawn as green dots.
 
 ```bash
-MUJOCO_GL=osmesa python -m lawm_deploy --config configs/sim.yaml --standin   # the page, plus sliders to place the robot
+MUJOCO_GL=osmesa python -m lawm_deploy --config configs/sim.yaml              # the page with the real model (GPU)
+MUJOCO_GL=osmesa python -m lawm_deploy.sim_demo --task reach                   # an example goal and start, one Run, no page
 MUJOCO_GL=osmesa pytest tests
 ```
 
+In simulation the page has an extra **Simulation** panel. On the real robot it is absent: you arrange the robot and objects by hand, and film the run yourself.
+
+- **Place the robot:** sliders move the hand from home and set the finger closure. Tick **Arrange directly** to put the robot there at once, as a person would arrange the real cell. **Example reach / grasp goal** fills in the sliders. **Reset scene** puts the robot home with the hand open and the objects back.
+- **Video:** shows the latest frame.
+
+For a trial in simulation:
+1. Load an example (or set your own) and press **Move**, then **Capture goal**.
+2. Press **Reset scene**, then **Capture start**.
+3. Press **Run**.
+
 ## Not verified yet
+- Teleoperation mode assumes the Sharpa SDK lets this program **read** the hand's joint angles while your teleop system commands it. If the SDK allows only one client, the hand angles must come from the teleop system instead: tell Vinay.
 - Nothing here has run on the real hardware.
 - The Sharpa SDK calls are still a stub (see step 1).
 - The UR7e is modelled with the UR5e kinematics from MuJoCo Menagerie. The rotations match UR's base frame exactly and positions are within 2 mm of the UR5e DH table. That the UR7e shares those kinematics is an assumption: the calibration residual and the hand overlay in step 4 will show if it does not.

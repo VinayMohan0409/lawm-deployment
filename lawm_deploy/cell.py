@@ -120,15 +120,38 @@ class RealCell:
 
     def __init__(self, cfg, hand_joint_names, calibrated=True):
         """Connect to the arm, the hand and the cameras from the config's cell section; calibrated=False uses the rough camera poses (for calibrating)."""
-        import rtde_control
         import rtde_receive
-        self.motion = MotionSettings(**cfg["motion"])
-        self.ctrl = rtde_control.RTDEControlInterface(cfg["robot_ip"])
-        self.recv = rtde_receive.RTDEReceiveInterface(cfg["robot_ip"])
-        self.ctrl.setTcp([0.0] * 6)  # poses are flange poses; the hand mount lives in the config, not on the pendant
+        self.motion, self.ip, self.ctrl = MotionSettings(**cfg["motion"]), cfg["robot_ip"], None
+        self.recv = rtde_receive.RTDEReceiveInterface(self.ip)  # read-only: works alongside a teleoperation system
+        self.take_control()
         self.hand = SharpaHand(cfg.get("sharpa", {}), hand_joint_names)
         c = cfg["cameras"]
         self.cameras = RealSense([d["serial"] for d in c["devices"]], camera_poses(c, calibrated), c["width"], c["height"], c["fps"], c["n_frames"], c.get("preset"))
+
+    def take_control(self):
+        """Connect the control interface (runs the RTDE control script on the UR); TCP = flange, the hand mount lives in the config."""
+        import rtde_control
+        if self.ctrl is None:
+            self.ctrl = rtde_control.RTDEControlInterface(self.ip)
+            self.ctrl.setTcp([0.0] * 6)
+
+    def release(self):
+        """Hand the robot over (e.g. to a teleoperation system): stop the control script; state and cameras are still read."""
+        if self.ctrl is not None:
+            self.ctrl.stopScript()
+            self.ctrl.disconnect()
+            self.ctrl = None
+
+    @property
+    def released(self):
+        """True while another system has the robot."""
+        return self.ctrl is None
+
+    def control(self):
+        """The control interface, or an error while the robot is released."""
+        if self.ctrl is None:
+            raise RuntimeError("the robot is released (teleoperation mode): take control first")
+        return self.ctrl
 
     def state(self):
         """(6 arm angles, 22 hand angles, 4x4 flange pose) as measured."""
@@ -140,23 +163,24 @@ class RealCell:
 
     def ik(self, target, q_near):
         """The UR controller's IK solution for a flange target near q_near, or None."""
-        x = vec_from_pose(target)
-        if not self.ctrl.getInverseKinematicsHasSolution(x, list(map(float, q_near))):
+        x, ctrl = vec_from_pose(target), self.control()
+        if not ctrl.getInverseKinematicsHasSolution(x, list(map(float, q_near))):
             return None
-        return np.array(self.ctrl.getInverseKinematics(x, list(map(float, q_near))))
+        return np.array(ctrl.getInverseKinematics(x, list(map(float, q_near))))
 
     def move(self, target, q_hand):
         """Straight-line flange move (moveL, asynchronous) with the fingers on a minimum-jerk path over the same time, then wait to settle."""
+        ctrl = self.control()
         q_arm, q0, flange = self.state()
         duration = move_duration(self.motion, flange, target, q0, q_hand)
-        self.ctrl.moveL(vec_from_pose(target), self.motion.speed, self.motion.accel, True)
+        ctrl.moveL(vec_from_pose(target), self.motion.speed, self.motion.accel, True)
         start, dt = time.time(), 1.0 / self.motion.finger_rate_hz
         while (t := time.time() - start) < duration:
             self.hand.write(q0 + (np.asarray(q_hand) - q0) * min_jerk(t / duration))
             time.sleep(dt)
         self.hand.write(np.asarray(q_hand))
         deadline = time.time() + 2 * duration + 5.0
-        while self.ctrl.getAsyncOperationProgress() >= 0:
+        while ctrl.getAsyncOperationProgress() >= 0:
             if time.time() > deadline or self.recv.isProtectiveStopped():
                 self.stop()
                 raise RuntimeError("arm move did not finish (timeout or protective stop)")
@@ -165,15 +189,16 @@ class RealCell:
 
     def freedrive(self, on):
         """Let the arm be moved by hand (UR teach mode) or hold it again."""
-        self.ctrl.teachMode() if on else self.ctrl.endTeachMode()
+        self.control().teachMode() if on else self.control().endTeachMode()
 
     def stop(self):
-        """Stop the arm and hold the fingers where they are."""
-        self.ctrl.stopL(2.0)
-        self.hand.write(self.hand.read())
+        """Stop the arm and hold the fingers where they are (nothing to do while released)."""
+        if self.ctrl is not None:
+            self.ctrl.stopL(2.0)
+            self.hand.write(self.hand.read())
 
     def close(self):
         """Stop and disconnect."""
         self.stop()
         self.cameras.close()
-        self.ctrl.stopScript()
+        self.release()

@@ -12,8 +12,14 @@ import viser
 
 from lawm.sim.costs import SEG_HAND
 
-GRAY, BLUE, GREEN, ORANGE, YELLOW, RED = (150, 150, 150), (30, 110, 220), (40, 170, 70), (240, 140, 20), (230, 200, 0), (220, 40, 40)
+GRAY, BLUE, GREEN, ORANGE, YELLOW, RED, PURPLE = (150, 150, 150), (30, 110, 220), (40, 170, 70), (240, 140, 20), (230, 200, 0), (220, 40, 40), (150, 60, 200)
+LEGEND = ("**Colours:** blue = hand now (joint angles + mesh), green = goal hand, purple = start hand, orange = hand after the planned move, "
+          "gray = camera scene (model input), red = raw camera points (overlay check), yellow = workspace box.")
 FLEX = ("FE", "PIP", "DIP", "IP")  # Sharpa joints that curl a finger (the sim jog closes these)
+SIM_PRESETS = {  # flange offset from home (m), finger closure, arrange directly; the grasp wraps the red cube of configs/sim.yaml
+    "reach": ((0.06, -0.06, -0.12), 0.3, False),
+    "grasp": ((0.013, 0.033, -0.342), 0.5, True),
+}
 
 
 def box_edges(lo, hi):
@@ -55,11 +61,22 @@ class App:
             self.show_raw = gui.add_checkbox("Show raw camera points", False, hint="Overlay check: red camera points on the arm and hand should sit on the blue mesh hand")
             gui.add_button("Save box to config").on_click(lambda _: self.save())
             self.counts = gui.add_markdown("")
+        if hasattr(session.cell, "freedrive"):  # real robot: arrange it by teleoperation or by hand
+            with gui.add_folder("Arrange the robot"):
+                gui.add_markdown("**Teleoperation:** tick Teleoperation mode to hand the robot to your teleop system; the view and captures keep working. Untick it before Plan, Step or Run.  \n"
+                                 "**By hand:** tick Freedrive to move the arm, untick to hold it, and set the fingers with the slider.")
+                self.teleop = gui.add_checkbox("Teleoperation mode (release the robot)", False)
+                self.teleop.on_update(lambda _: self.background(lambda: self.set_teleop(self.teleop.value)))
+                self.free = gui.add_checkbox("Freedrive (arm)", False)
+                self.free.on_update(lambda _: self.background(lambda: self.set_freedrive(self.free.value)))
+                self.real_closure = gui.add_slider("finger closure", 0.0, 1.0, 0.05, 0.0)
+                gui.add_button("Set fingers").on_click(lambda _: self.background(self.set_fingers))
         with gui.add_folder("2. Goal, then start"):
             gui.add_button("Capture goal").on_click(lambda _: self.capture("goal"))
             gui.add_button("Capture start").on_click(lambda _: self.capture("start"))
             self.show_goal = gui.add_checkbox("Show goal hand", True)
             self.show_goal_scene = gui.add_checkbox("Show goal scene", False)
+            self.show_start = gui.add_checkbox("Show start hand", True)
             self.captured = gui.add_markdown("Goal: none. Start: none.")
         with gui.add_folder("3. Run"):
             self.task = gui.add_dropdown("Task", ("reach", "grasp"))
@@ -68,16 +85,30 @@ class App:
             gui.add_button("Run").on_click(lambda _: self.background(self.run))
             gui.add_button("Stop", color="red").on_click(lambda _: self.stop())
             self.status = gui.add_markdown("Idle.")
+            gui.add_markdown(LEGEND)
+        with gui.add_folder("4. Check model frame", expand_by_default=False):
+            gui.add_markdown("If Plan only keeps choosing hold, the model may be reading this layout in the wrong frame. This tries 8 spins on the current view: pick the one with the most hand motion and the least scene motion, and set `model.spin_deg` in the config (restart to apply). About a minute.")
+            gui.add_button("Check model frame").on_click(lambda _: self.background(self.check_frame))
+            self.frame_report = gui.add_markdown("")
         if sim_cell is not None:
-            with gui.add_folder("Sim only: place the robot"):
-                self.jog = [gui.add_slider(f"d{a} (m)", -0.3, 0.3, 0.005, 0.0) for a in "xyz"]
-                self.closure = gui.add_slider("finger closure", 0.0, 1.0, 0.05, 0.0)
-                gui.add_button("Move").on_click(lambda _: self.background(self.sim_move))
-                self.home = sim_cell.state()[2]
+            with gui.add_folder("Simulation"):
+                with gui.add_folder("Place the robot"):
+                    self.jog = [gui.add_slider(f"d{a} from home (m)", -0.45, 0.45, 0.001, 0.0) for a in "xyz"]
+                    self.closure = gui.add_slider("finger closure", 0.0, 1.0, 0.05, 0.0)
+                    self.arrange = gui.add_checkbox("Arrange directly", False, hint="Put the robot there at once (as a person arranges the real cell) instead of driving it there; objects stay")
+                    gui.add_button("Move").on_click(lambda _: self.background(self.sim_move))
+                    gui.add_button("Reset scene (robot home, hand open, objects back)").on_click(lambda _: self.background(self.sim_reset))
+                    for name, preset in SIM_PRESETS.items():
+                        gui.add_button(f"Example {name} goal").on_click(lambda _, p=preset: self.sim_preset(p))
+                    self.home = sim_cell.state()[2]
+                with gui.add_folder("Video"):
+                    self.video_frame = gui.add_image(sim_cell.render_frame(), label="latest frame (green dots: goal hand)")
+                    self.video_path = gui.add_markdown("Each run is recorded to `video.mp4` in its run folder.")
         for handle in (self.use_box, self.xs, self.ys, self.zs):
             handle.on_update(lambda _: self.box_changed())
         self.show_goal.on_update(lambda _: self.draw_goal())
         self.show_goal_scene.on_update(lambda _: self.draw_goal())
+        self.show_start.on_update(lambda _: self.draw_start())
         lo, hi = np.asarray(p.box_lo), np.asarray(p.box_hi)
         self.server.initial_camera.look_at = tuple((lo + hi) / 2)
         self.server.initial_camera.position = tuple((lo + hi) / 2 + [0.9, -0.9, 0.7])
@@ -110,6 +141,12 @@ class App:
         if self.session.goal is not None:
             self.draw("/goal", self.session.goal, GREEN, (120, 200, 140), self.show_goal.value, self.show_goal_scene.value)
 
+    def draw_start(self):
+        """Draw the start hand (purple), shown or hidden."""
+        if self.session.start is not None:
+            hand = self.session.start.segment == SEG_HAND
+            self.scene.add_point_cloud("/start/hand", self.session.start.coords[hand], PURPLE, point_size=0.004, point_shape="rounded", visible=self.show_start.value)
+
     def refresh(self):
         """Observe now and draw it, with the point counts."""
         with self.lock:
@@ -137,6 +174,7 @@ class App:
         g, s = self.session.goal is not None, self.session.current is not None
         self.captured.content = f"Goal: {'captured' if g else 'none'}. Start: {'captured' if s else 'none'}. Log: `{self.session.log}`"
         self.draw_goal()
+        self.draw_start()
         if self.session.current is not None:
             self.draw("/current", self.session.current, BLUE, GRAY)
 
@@ -148,7 +186,10 @@ class App:
         threading.Thread(target=fn, daemon=True).start()
 
     def ready(self):
-        """Set up the planner if the task or the captures changed; False with a message if goal or start is missing."""
+        """Set up the planner if the task or the captures changed; False with a message if goal or start is missing or the robot is released."""
+        if getattr(self.session.cell, "released", False):
+            self.status.content = "The robot is released (Teleoperation mode): untick it first."
+            return False
         if self.session.goal is None or self.session.current is None:
             self.status.content = "Capture the goal, then the start."
             return False
@@ -162,8 +203,11 @@ class App:
         if self.session.last_plan is not None:
             self.scene.add_point_cloud("/plan/hand", self.session.last_plan["commanded_hand"], ORANGE, point_size=0.004, point_shape="rounded")
         self.draw("/current", self.session.current, BLUE, GRAY)
+        if self.sim is not None:
+            self.video_frame.image = self.sim.frame
+            self.video_path.content = f"Recording to `{self.session.run_dir / 'video.mp4'}` (complete when the run ends)."
         self.status.content = (f"Replan {record['replan']}: distance {record['distance_mm']:.1f} mm, {'moved' if record['moved'] else 'held' if record['hold'] else 'planned, no motion'}"
-                               f"{' (' + record['hold'] + ')' if record['hold'] else ''}, fit {record['fit_residual_mm']:.1f} mm."
+                               f"{' (' + record['hold'] + ')' if record['hold'] else ''}, fit {record['fit_residual_mm']:.1f} mm, within {self.session.loop.success_mm:.0f} mm of the goal for {record['within_success']}/{self.session.loop.success_replans} replans."
                                f"{' **Stop: ' + record['stop'] + '**' if record['stop'] else ''}")
 
     def plan_only(self):
@@ -184,7 +228,7 @@ class App:
         with self.lock:
             if self.ready():
                 reason = self.session.run(execute=True, should_stop=self.stop_flag.is_set, on_step=self.show)
-                self.status.content += f"  \nRun ended: **{reason}**."
+                self.status.content += f"  \nRun ended: **{reason}**. Logs: `{self.session.run_dir}`"
 
     def stop(self):
         """Stop after the current move and hold the robot."""
@@ -194,12 +238,81 @@ class App:
 
     def sim_move(self):
         """Sim only: move the flange by the jog offsets from home and close the fingers by the slider."""
-        names, limits = self.session.robot.hand_joint_names, self.session.robot.hand_limits
-        q = np.array([self.closure.value * hi if any(n.endswith(f) or f"_{f}" in n for f in FLEX) else 0.0 for n, (lo, hi) in zip(names, limits)])
+        q = self.closure_angles(self.closure.value)
         target = self.home.copy()
         target[:3, 3] += [j.value for j in self.jog]
         with self.lock:
-            self.sim.move(target, q)
+            if self.arrange.value:
+                q_arm = self.sim.ik(target, self.sim.state()[0])
+                if q_arm is None:
+                    self.status.content = "No IK solution for that pose."
+                    return
+                self.sim.set_state(q_arm, q, self.sim.object_positions())
+            else:
+                self.sim.move(target, q)
+        self.video_frame.image = self.sim.render_frame()
+
+    def sim_reset(self):
+        """Sim only: robot at home with the hand open, objects back where the config has them."""
+        with self.lock:
+            self.sim.set_state(np.radians(self.sim.cfg["home_deg"]), np.zeros(22), [o["pos"] for o in self.sim.cfg["objects"]])
+        for j in self.jog:
+            j.value = 0.0
+        self.closure.value, self.arrange.value = 0.0, False
+        self.video_frame.image = self.sim.render_frame()
+        self.status.content = "Scene reset: robot at home, hand open, objects at their config positions. Now Capture start."
+
+    def sim_preset(self, preset):
+        """Sim only: fill the placement sliders with an example goal (press Move to apply)."""
+        offset, closure, arrange = preset
+        for j, v in zip(self.jog, offset):
+            j.value = v
+        self.closure.value, self.arrange.value = closure, arrange
+        self.status.content = "Example loaded: press Move, then Capture goal. Then Reset scene and Capture start."
+
+    def closure_angles(self, closure):
+        """Sharpa angles with the curling joints at closure of their upper limit, the others at 0."""
+        names, limits = self.session.robot.hand_joint_names, self.session.robot.hand_limits
+        return np.array([closure * hi if any(n.endswith(f) or f"_{f}" in n for f in FLEX) else 0.0 for n, (lo, hi) in zip(names, limits)])
+
+    def set_teleop(self, on):
+        """Real robot: release it to a teleoperation system, or take control back."""
+        with self.lock:
+            self.session.cell.release() if on else self.session.cell.take_control()
+        self.status.content = "Teleoperation mode: the robot is released; the live view follows it." if on else "Control taken back: Plan, Step and Run are available."
+
+    def set_freedrive(self, on):
+        """Real robot: arm teach mode on or off."""
+        with self.lock:
+            self.session.cell.freedrive(on)
+        self.status.content = "Freedrive on: move the arm by hand." if on else "Freedrive off: the arm holds."
+
+    def set_fingers(self):
+        """Move only the fingers to the slider's closure, the arm where it is."""
+        with self.lock:
+            if getattr(self, "free", None) is not None and self.free.value:
+                self.status.content = "Untick Freedrive first."
+                return
+            self.session.cell.move(self.session.cell.state()[2], self.closure_angles(self.real_closure.value))
+
+    def check_frame(self):
+        """For 8 spins of the model frame, the model's mean predicted motion (5 steps, 32 prior samples) of the hand and of the scene on the current view."""
+        from lawm_deploy.model import FramedModel, model_frame
+        if not isinstance(self.session.model, FramedModel):
+            self.frame_report.content = "Only with the real model."
+            return
+        with self.lock:
+            obs = self.session.observe()
+            inner, m = self.session.model.inner, self.session.cfg["model"]
+            mean, std = inner.prior
+            z = (mean[None] + std[None] * np.random.default_rng(0).normal(size=(32, *mean.shape))).astype(np.float32)
+            hand = obs.segment == SEG_HAND
+            rows = []
+            for spin in range(0, 360, 45):
+                d = FramedModel(inner, model_frame(m["training_up"], spin)).decoder(obs.coords, obs.segment)(z)
+                motion = np.linalg.norm(d[:, -1], axis=-1).mean(0) * 1000
+                rows.append(f"| {spin}{' (now)' if spin == m['spin_deg'] else ''} | {motion[hand].mean():.1f} | {motion[~hand].mean():.1f} |")
+        self.frame_report.content = "| spin (deg) | hand (mm) | scene (mm) |\n|---|---|---|\n" + "\n".join(rows)
 
     def serve(self):
         """Keep the live view fresh while idle, forever."""

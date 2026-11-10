@@ -6,6 +6,8 @@ model:
   checkpoint: checkpoint/best.pt
   manifest: checkpoint/run_manifest.json
   prior: checkpoint/prior.npz
+  training_up: [-0.022, -0.546, -0.837]   # "up" (table towards hands) in the training data's frame: mean of 200 training windows
+  spin_deg: 315                           # base-frame horizontal direction mapped to the training x axis (chosen in sim: most static scene)
 
 mount: {xyz_m: [0.0, 0.0, 0.0], rpy_deg: [0.0, 0.0, 0.0]}   # CHANGE: hand base (MJCF origin) in the UR flange frame, from the adapter drawing
 
@@ -59,6 +61,6 @@ planner:
   gates:
     hover: {margin_mm: 200.0, proximity_mm: 50.0, replan_cap: 40}   # grasp first aims 20 cm above the goal hand; lower if the workspace is short
 
-loop:
-  reach: {max_replans: 80, converge_mm: 10.0, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
-  grasp: {max_replans: 80, converge_mm: 10.0, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}
+loop:   # success: hand within success_mm of the goal hand for success_replans replans in a row
+  reach: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
+  grasp: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}

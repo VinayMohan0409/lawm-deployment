@@ -68,7 +68,9 @@ def test_reach_runs_and_logs(cell, tmp_path):
     for _ in range(5):
         record = s.step()
     assert record["distance_mm"] < 0.5 * first
-    assert len(list(s.log.glob("replan_*.npz"))) == 6 and (s.log / "goal.npz").exists()
+    s.finish()
+    assert len(list(s.run_dir.glob("replan_*.npz"))) == 6 and (s.run_dir / "goal.npz").exists()
+    assert (s.run_dir / "video.mp4").stat().st_size > 10000
 
 
 def test_dry_run_does_not_move(cell, tmp_path):

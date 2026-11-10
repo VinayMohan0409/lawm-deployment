@@ -27,3 +27,17 @@ def test_checks():
     assert "finger" in check(S, FLANGE, **{**GOOD, "q_hand": np.full(22, 1.5)})
     assert "floor" in check(S, FLANGE, **{**GOOD, "hand_points": np.array([[0.5, 0.0, -0.01]])})
     assert "box" in check(S, pose(FLANGE[:3, :3], [2.0, 0, 0.5]), **GOOD)
+
+
+def test_model_frame_round_trip():
+    """The training-frame rotation is a proper rotation taking z to the training up, and the wrapped model's displacements come back in the base frame."""
+    from lawm_deploy.model import FramedModel, StandInModel, model_frame
+    up = np.array([-0.022, -0.546, -0.837])
+    R = model_frame(up, 315)
+    assert np.allclose(R @ R.T, np.eye(3), atol=1e-9) and np.isclose(np.linalg.det(R), 1.0)
+    assert np.allclose(R @ [0, 0, 1.0], up / np.linalg.norm(up))
+    coords, seg = np.random.default_rng(0).normal(size=(50, 3)).astype(np.float32), np.r_[np.zeros(20), np.ones(30)].astype(np.int8)
+    z = np.random.default_rng(1).normal(size=(4, 5, 2, 4)).astype(np.float32)
+    inner = StandInModel()
+    out = FramedModel(inner, R).decoder(coords, seg)(z)
+    assert np.allclose(out, inner.decoder(coords @ R.T, seg)(z) @ R, atol=1e-6)

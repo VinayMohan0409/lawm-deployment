@@ -1,4 +1,4 @@
-"""A MuJoCo stand-in of the real cell: the same robot on a table with one object and two depth cameras at D435i resolution, behind the RealCell interface."""
+"""A MuJoCo stand-in of the real cell: the same robot on a table with objects and two depth cameras at D435i resolution, behind the RealCell interface, plus a video camera that records the moves."""
 from __future__ import annotations
 
 import mujoco
@@ -22,7 +22,7 @@ def build(cfg, mount):
     """The compiled cell: robot, table top at z = 0 under the robot base, free box objects, two cameras."""
     spec = cell_spec(mount)
     vis = getattr(spec.visual, "global")
-    vis.offwidth, vis.offheight = cfg["width"], cfg["height"]
+    vis.offwidth, vis.offheight = max(cfg["width"], cfg["video"]["width"]), max(cfg["height"], cfg["video"]["height"])
     world = spec.worldbody
     world.add_light(pos=[0.5, 0, 2.0], dir=[0, 0, -1], directional=True)
     t = cfg["table"]
@@ -33,6 +33,8 @@ def build(cfg, mount):
         body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[s / 2 for s in o["size"]], mass=o["mass"], friction=[1.5, 0.01, 0.001], rgba=o["rgba"])
     for name, cam in cfg["cameras"].items():
         world.add_camera(name=name, pos=cam["eye"], quat=quat_of(look_at(np.asarray(cam["eye"], float), cam["target"])), fovy=cfg["fovy_deg"])
+    v = cfg["video"]
+    world.add_camera(name="video", pos=v["eye"], quat=quat_of(look_at(np.asarray(v["eye"], float), v["target"])), fovy=v["fovy_deg"])
     return spec.compile()
 
 
@@ -53,6 +55,9 @@ class SimCell:
         self.cams = [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, n) for n in cfg["cameras"]]
         self.renderer = mujoco.Renderer(self.model, cfg["height"], cfg["width"])
         self.renderer.enable_depth_rendering()
+        v = cfg["video"]
+        self.video = mujoco.Renderer(self.model, v["height"], v["width"])
+        self.writer, self.frame, self.markers, self.next_frame = None, None, np.zeros((0, 3)), 0.0
         self.rng = np.random.default_rng(seed)
         self.dt = self.model.opt.timestep
         self.set_state(np.radians(cfg["home_deg"]), np.zeros(22), [o["pos"] for o in cfg["objects"]])
@@ -68,9 +73,42 @@ class SimCell:
         self.wait(0.5)
 
     def wait(self, seconds):
-        """Simulate for a while with the controls unchanged."""
+        """Simulate for a while with the controls unchanged, writing video frames while recording."""
         for _ in range(int(round(seconds / self.dt))):
             mujoco.mj_step(self.model, self.data)
+            if self.writer is not None and self.data.time >= self.next_frame:
+                self.writer.append_data(self.render_frame())
+                self.next_frame = self.data.time + 1.0 / self.cfg["video"]["fps"]
+
+    def render_frame(self):
+        """An RGB frame of the video camera with the markers (the goal hand) as green dots; also kept as the latest frame."""
+        self.video.update_scene(self.data, "video")
+        scene = self.video.scene
+        for p in self.markers:
+            if scene.ngeom >= scene.maxgeom:
+                break
+            mujoco.mjv_initGeom(scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_SPHERE, np.array([0.004, 0, 0]), p, np.eye(3).ravel(), np.array([0.1, 0.8, 0.2, 0.8], np.float32))
+            scene.ngeom += 1
+        self.frame = self.video.render().copy()
+        return self.frame
+
+    def set_markers(self, points, n=200):
+        """Points drawn in the video (a subsample of n), e.g. the goal hand."""
+        self.markers = np.asarray(points, float)[np.linspace(0, len(points) - 1, min(n, len(points))).astype(int)]
+
+    def start_recording(self, path):
+        """Write the moves from now on to an mp4 file."""
+        import imageio
+        self.stop_recording()
+        self.writer = imageio.get_writer(str(path), fps=self.cfg["video"]["fps"], codec="libx264", quality=7, macro_block_size=8)
+        self.writer.append_data(self.render_frame())
+        self.next_frame = self.data.time
+
+    def stop_recording(self):
+        """Close the video file, if one is open."""
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
 
     def state(self):
         """(6 arm angles, 22 hand angles, 4x4 flange pose)."""
@@ -138,5 +176,7 @@ class SimCell:
         self.data.ctrl[:6], self.data.ctrl[6:28] = q_arm, q_hand
 
     def close(self):
-        """Free the renderer now (a renderer freed later by the garbage collector can break another one mid-render)."""
+        """Close the video and free the renderers now (a renderer freed later by the garbage collector can break another one mid-render)."""
+        self.stop_recording()
         self.renderer.close()
+        self.video.close()
