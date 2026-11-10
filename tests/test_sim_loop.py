@@ -82,3 +82,67 @@ def test_dry_run_does_not_move(cell, tmp_path):
     before = cell.state()[0]
     s.step(execute=False)
     np.testing.assert_allclose(cell.state()[0], before)
+
+
+def started(cell, tmp_path):
+    """A session with a reach goal 6 cm away and the start at home, captured."""
+    s = Session(cell, CFG, StandInModel(), tmp_path)
+    _, _, home = cell.state()
+    goal = home.copy()
+    goal[:3, 3] += [0.05, -0.04, -0.06]
+    cell.move(goal, np.zeros(22))
+    s.capture_goal()
+    cell.move(home, np.zeros(22))
+    s.capture_start()
+    return s, home
+
+
+def test_step_after_robot_moved_uses_fresh_state(cell, tmp_path):
+    """If the robot moved after the start was captured, the step plans from where it is: the flange moves at most max_step_mm."""
+    s, home = started(cell, tmp_path)
+    s.begin("reach")
+    away = home.copy()
+    away[:3, 3] += [0.0, 0.2, 0.05]
+    cell.move(away, np.zeros(22))
+    before = cell.state()[2][:3, 3]
+    record = s.step()
+    travelled = np.linalg.norm(cell.state()[2][:3, 3] - before) * 1000
+    assert record["moved"] and travelled <= CFG["safety"]["max_step_mm"] + 5
+
+
+def test_each_run_is_new_and_plan_only_changes_nothing(cell, tmp_path):
+    """Plan only leaves the run's counters and logs alone; a second begin starts a fresh run in its own folder."""
+    s, _ = started(cell, tmp_path)
+    s.begin("reach")
+    first_dir = s.run_dir
+    s.step(execute=False)
+    assert s.replan == 0 and s.records == [] and not list(first_dir.glob("replan_*.npz"))
+    s.step()
+    import time
+    time.sleep(1.1)  # run folders are named by the second
+    s.begin("reach")
+    assert s.run_dir != first_dir and s.replan == 0 and s.records == [] and not s.finished
+
+
+def test_stop_halts_a_move(cell):
+    """With Stop requested, a long move ends early and the robot holds."""
+    _, _, flange = cell.state()
+    target = flange.copy()
+    target[:3, 3] += [0.0, 0.0, -0.2]
+    cell.stop_requested.set()
+    cell.move(target, np.full(22, 0.5))
+    assert np.linalg.norm(cell.state()[2][:3, 3] - flange[:3, 3]) < 0.01
+
+
+def test_unsent_commands_do_not_change_the_executor():
+    """The rotation smoothing starts from the last target actually sent."""
+    from scipy.spatial.transform import Rotation
+
+    from lawm_deploy.robot_model import pose
+    from lawm_deploy.safety import Executor, SafetySettings
+    ex = Executor(SafetySettings(**CFG["safety"]), np.eye(4))
+    turned = pose(Rotation.from_euler("z", 20, degrees=True).as_matrix(), [0, 0, 0])
+    ex.command(turned[:3, :3], turned[:3, 3], np.zeros(22), np.eye(4), np.eye(4))
+    assert np.allclose(ex.last_rotvec, 0)
+    ex.sent(turned)
+    assert np.allclose(ex.last_rotvec, Rotation.from_euler("z", 20, degrees=True).as_rotvec())

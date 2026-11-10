@@ -1,6 +1,7 @@
 """The robot cell behind one interface (state, views, ik, move, stop) and its real backend: UR7e over RTDE, Sharpa Wave over its SDK, two D435i over USB."""
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
@@ -101,9 +102,11 @@ class RealSense:
                 pipe.wait_for_frames()
 
     def views(self):
-        """[(depth m, K, pose)] for every camera, each the per-pixel median of n_frames (0 = no depth)."""
+        """[(depth m, K, pose)] for every camera, each the per-pixel median of n_frames (0 = no depth), after dropping frames queued before this call."""
         out = []
         for pipe, scale, K, T in self.cams:
+            while pipe.poll_for_frames():  # drop frames buffered during a move
+                pass
             frames = np.stack([np.asanyarray(pipe.wait_for_frames().get_depth_frame().get_data()) for _ in range(self.n_frames)]).astype(np.float32) * scale
             frames[frames == 0] = np.nan
             out.append((np.nan_to_num(np.nanmedian(frames, axis=0)), K, T))
@@ -121,7 +124,8 @@ class RealCell:
     def __init__(self, cfg, hand_joint_names, calibrated=True):
         """Connect to the arm, the hand and the cameras from the config's cell section; calibrated=False uses the rough camera poses (for calibrating)."""
         import rtde_receive
-        self.motion, self.ip, self.ctrl = MotionSettings(**cfg["motion"]), cfg["robot_ip"], None
+        self.motion, self.ip, self.ctrl, self.teach = MotionSettings(**cfg["motion"]), cfg["robot_ip"], None, False
+        self.stop_requested = threading.Event()  # set by the page's Stop; the moving thread itself stops the robot
         self.recv = rtde_receive.RTDEReceiveInterface(self.ip)  # read-only: works alongside a teleoperation system
         self.take_control()
         self.hand = SharpaHand(cfg.get("sharpa", {}), hand_joint_names)
@@ -169,27 +173,39 @@ class RealCell:
         return np.array(ctrl.getInverseKinematics(x, list(map(float, q_near))))
 
     def move(self, target, q_hand):
-        """Straight-line flange move (moveL, asynchronous) with the fingers on a minimum-jerk path over the same time, then wait to settle."""
+        """Straight-line flange move (moveL, asynchronous) with the fingers on a minimum-jerk path over the same time, then wait to settle; a Stop request halts arm and fingers from this thread."""
+        if self.teach:
+            raise RuntimeError("freedrive is on: untick it first")
         ctrl = self.control()
         q_arm, q0, flange = self.state()
         duration = move_duration(self.motion, flange, target, q0, q_hand)
         ctrl.moveL(vec_from_pose(target), self.motion.speed, self.motion.accel, True)
         start, dt = time.time(), 1.0 / self.motion.finger_rate_hz
-        while (t := time.time() - start) < duration:
+        while (t := time.time() - start) < duration and not self.stop_requested.is_set():
             self.hand.write(q0 + (np.asarray(q_hand) - q0) * min_jerk(t / duration))
             time.sleep(dt)
-        self.hand.write(np.asarray(q_hand))
+        if not self.stop_requested.is_set():
+            self.hand.write(np.asarray(q_hand))
         deadline = time.time() + 2 * duration + 5.0
         while ctrl.getAsyncOperationProgress() >= 0:
+            if self.stop_requested.is_set():
+                break
             if time.time() > deadline or self.recv.isProtectiveStopped():
-                self.stop()
+                try:
+                    self.stop()
+                except Exception:  # the robot may refuse commands in a protective stop; report the cause below
+                    pass
                 raise RuntimeError("arm move did not finish (timeout or protective stop)")
             time.sleep(0.01)
+        if self.stop_requested.is_set():
+            self.stop()
+            return
         time.sleep(self.motion.settle_s)
 
     def freedrive(self, on):
         """Let the arm be moved by hand (UR teach mode) or hold it again."""
         self.control().teachMode() if on else self.control().endTeachMode()
+        self.teach = on
 
     def stop(self):
         """Stop the arm and hold the fingers where they are (nothing to do while released)."""

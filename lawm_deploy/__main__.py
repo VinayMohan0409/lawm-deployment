@@ -31,7 +31,12 @@ def main():
         cell = RealCell(cfg["cell"], hand_spec()[1])
     model = StandInModel() if args.standin else load_model(cfg)
     session = Session(cell, cfg, model, config.repo_path(cfg["log_dir"]))
-    App(session, args.config, args.port, cell if cfg["cell"]["type"] == "sim" else None).serve()
+    try:
+        App(session, args.config, args.port, cell if cfg["cell"]["type"] == "sim" else None).serve()
+    except KeyboardInterrupt:
+        print("stopping")
+    finally:
+        cell.close()  # stops the arm, ends the UR control script and the cameras
 
 
 if __name__ == "__main__":

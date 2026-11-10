@@ -99,8 +99,8 @@ def main():
     results = calibrate(robot, frames, camera_poses(cfg["cell"]["cameras"], calibrated=False))
     out = {}
     for d, (T, residual, share) in zip(cfg["cell"]["cameras"]["devices"], results):
-        verdict = "OK" if residual < 3.0 and share > 0.7 else "SUSPECT: re-measure the rough pose (eye within 3 cm, aim within 5 deg) and rerun"
-        print(f"camera {d['serial']}: {share:.0%} of the robot points matched, median distance {residual:.1f} mm -> {verdict}")
+        verdict = "OK" if share > 0.7 else "SUSPECT: re-measure the rough pose (eye within 3 cm, aim within 5 deg) and rerun"
+        print(f"camera {d['serial']}: {share:.0%} of the moving (robot) points matched within 5 mm, median {residual:.1f} mm -> {verdict}")
         out[str(d["serial"])] = np.round(T, 6).tolist()
     path = config.repo_path(cfg["cell"]["cameras"]["calibration"])
     path.write_text(f"# camera optical-frame poses in the robot base frame, written by lawm_deploy.calibrate on {time.strftime('%Y-%m-%d %H:%M')}\n" + yaml.safe_dump(out))

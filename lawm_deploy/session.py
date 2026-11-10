@@ -76,11 +76,13 @@ class Session:
         self.log = Path(log_root) / time.strftime("%Y%m%d_%H%M%S")
         self.log.mkdir(parents=True, exist_ok=True)
         self.goal = self.start = self.current = self.planner = self.last_plan = self.run_dir = None
-        self.task, self.replan, self.holds, self.records = None, 0, 0, []
+        self.task, self.replan, self.holds, self.records, self.finished = None, 0, 0, [], True
 
     def observe(self):
-        """Read the joints, place the hand by forward kinematics, read the cameras and build the cloud."""
-        q_arm, q_hand, flange = self.cell.state()
+        """Read the joints, place the flange and hand by forward kinematics (not the controller's TCP, which a teleop system may change), read the cameras and build the cloud."""
+        q_arm, q_hand, _ = self.cell.state()
+        self.robot.set(q_arm, q_hand)
+        flange = self.robot.flange_pose()
         root = flange @ self.robot.root_in_flange
         views = self.cell.views()
         coords, segment, info = self.perception(views, self.robot.surface(q_arm, q_hand), self.hand.points(root, q_hand))
@@ -106,50 +108,68 @@ class Session:
         self.save("start", self.current)
         return self.current
 
+    def up_to_date(self):
+        """The current observation, observed again if the robot has moved since (teleop, freedrive, finger moves, a failed step)."""
+        q_arm, q_hand, _ = self.cell.state()
+        c = self.current
+        if c is None or np.degrees(np.abs(q_arm - c.q_arm).max()) > 0.5 or np.degrees(np.abs(q_hand - c.q_hand).max()) > 2.0:
+            self.current = self.observe()
+        return self.current
+
     def begin(self, task):
-        """Set up the planner of a task on the captured goal and start, in a new run folder holding copies of both."""
+        """Start a run of a task towards the captured goal from the robot as it is now, in a new run folder (goal, captured start, run start)."""
         assert task in TASKS, task
-        assert self.goal is not None and self.current is not None, "capture the goal, then the start"
+        assert self.goal is not None and self.start is not None, "capture the goal, then the start"
+        self.current = self.observe()
         cem, weights, gates = planner_settings(self.cfg, task)
         seed = int(np.random.SeedSequence([self.cfg["seed"], TASKS.index(task), int(time.time())]).generate_state(1)[0])
         self.planner = TaskPlanner(task, self.goal.coords, self.goal.segment, self.hand.finger_mask, self.model, seed, cem, weights, gates)
         self.executor = Executor(self.safety, self.current.flange)
         self.loop = LoopSettings(**self.cfg["loop"][task])
         self.stall = None if self.loop.stall_patience is None else StallDetector(self.loop.stall_patience, self.loop.stall_tol_mm)
-        self.task, self.replan, self.holds, self.within, self.records = task, 0, 0, 0, []
+        self.task, self.replan, self.holds, self.within, self.records, self.finished, self.plan_only_count = task, 0, 0, 0, [], False, 0
         self.run_dir = self.log / f"{time.strftime('%H%M%S')}_{task}"
         self.run_dir.mkdir()
         (self.run_dir / "run.json").write_text(json.dumps(dict(task=task, seed=seed, config=self.cfg), indent=1))
         self.save("goal", self.goal, self.run_dir)
-        self.save("start", self.current, self.run_dir)
+        self.save("start", self.start, self.run_dir)
+        self.save("run_start", self.current, self.run_dir)
         if hasattr(self.cell, "start_recording"):  # simulated cell: record the run
             self.cell.start_recording(self.run_dir / "video.mp4")
 
     def step(self, execute=True):
-        """One replan: plan on the current cloud, fit the hand to predicted step 1, check, move (if execute and safe), observe; returns the record, with 'stop' set when the run should end."""
-        obs = self.current
+        """One replan: plan on an up-to-date cloud, fit the hand to predicted step 1, check, move (if execute and safe), observe; returns the record, with 'stop' set when the run should end. execute=False only shows the plan: nothing moves and the run's counters, gates and logs are untouched."""
+        obs = self.up_to_date()
         hand_target, plan = self.planner.plan(obs.coords, self.replan)
         rot, pos, q, fit = self.hand.fit(hand_target, obs.q_hand)
         target, fingers, move_mm = self.executor.command(rot, pos, q, obs.root, obs.flange)
         q_ik = self.cell.ik(target, obs.q_arm)
         commanded_hand = self.hand.points(target @ self.robot.root_in_flange, fingers)
         hold = check(self.safety, target, fingers, obs.q_hand, obs.flange, obs.q_arm, q_ik, fit, commanded_hand)
-        moved = execute and hold is None
+        self.last_plan = dict(hand_target=hand_target, commanded_hand=commanded_hand)
+        if not execute:
+            self.save(f"plan_only_{self.plan_only_count:03d}", obs, self.run_dir, delta=plan.delta.astype(np.float16), target=target, fingers=fingers, hand_target=hand_target)
+            self.plan_only_count += 1
+            return dict(replan=self.replan, distance_mm=task_distance_mm(obs, self.goal), moved=False, hold=hold, executed=plan.executed, plan_cost=plan.cost,
+                        predicted_error_mm=plan.final_hand_error_mm, commanded_mm=move_mm, fit_residual_mm=fit["mean_residual_mm"], phase_changed=False,
+                        within_success=self.within, stop=None, plan_only=True)
+        moved = hold is None
         if moved:
             self.cell.move(target, fingers)
+            self.executor.sent(target)
         self.holds = 0 if hold is None else self.holds + 1
         new = self.observe() if moved else obs
         phase = bool(self.planner.update(new.coords, self.replan))
         dist = task_distance_mm(new, self.goal)
         record = dict(replan=self.replan, distance_mm=dist, moved=moved, hold=hold, executed=plan.executed, plan_cost=plan.cost,
                       predicted_error_mm=plan.final_hand_error_mm, commanded_mm=move_mm, fit_residual_mm=fit["mean_residual_mm"], phase_changed=phase)
-        self.last_plan = dict(hand_target=hand_target, commanded_hand=commanded_hand)
         self.save(f"replan_{self.replan:03d}", obs, self.run_dir, delta=plan.delta.astype(np.float16), target=target, fingers=fingers, hand_target=hand_target)
         self.current, self.replan = new, self.replan + 1
         self.within = self.within + 1 if dist < self.loop.success_mm else 0
         record["within_success"] = self.within
         record["stop"] = ("success" if self.within >= self.loop.success_replans else "too many holds" if self.holds >= self.loop.max_holds
                           else "stalled" if moved and self.stall and self.stall.update(dist) else "max replans" if self.replan >= self.loop.max_replans else None)
+        self.finished = record["stop"] is not None
         self.records.append(record)
         with open(self.run_dir / "records.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -165,9 +185,8 @@ class Session:
                 if record["stop"]:
                     reason = record["stop"]
                     break
-            else:
-                self.cell.stop()
         finally:
+            self.finished = True
             self.finish()
         return reason
 

@@ -35,16 +35,19 @@ class Executor:
         self.last_rotvec = Rotation.from_matrix(flange_now[:3, :3]).as_rotvec()
 
     def command(self, root_rot, root_pos, q, root_now, flange_now):
-        """(4x4 flange target, 22 finger targets, unclipped translation in mm)."""
+        """(4x4 flange target, 22 finger targets, unclipped translation in mm); the smoothing state only changes once the target is sent (sent())."""
         pos, rotvec, fingers = hand_state_to_action(root_rot, root_pos, q, root_now[:3, :3], root_now[:3, 3], flange_now[:3, 3], flange_now[:3, :3])
         keys = Rotation.concatenate([Rotation.from_rotvec(self.last_rotvec), Rotation.from_rotvec(rotvec)])
         rotvec = Slerp([0, 1], keys)([self.s.ori_alpha])[0].as_rotvec()
-        self.last_rotvec = rotvec.copy()
         move = pos - flange_now[:3, 3]
         move_mm = float(np.linalg.norm(move) * 1000.0)
         if move_mm > self.s.max_step_mm:
             pos = flange_now[:3, 3] + move * (self.s.max_step_mm / move_mm)
         return pose(Rotation.from_rotvec(rotvec).as_matrix(), pos), np.asarray(fingers, dtype=float), move_mm
+
+    def sent(self, target):
+        """Record that a flange target was sent: the next rotation is smoothed from it."""
+        self.last_rotvec = Rotation.from_matrix(target[:3, :3]).as_rotvec()
 
 
 def check(settings, target, q_hand, q_hand_now, flange_now, q_arm_now, q_arm_ik, fit_info, hand_points):

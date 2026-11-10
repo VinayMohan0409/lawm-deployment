@@ -13,9 +13,15 @@ Each run is logged so it can be analysed afterwards.
 
 ## What you need
 - A Linux PC with an NVIDIA GPU (11 GB or more).
-- **UR7e:** connected by Ethernet. On the pendant, enable **Remote Control** and **RTDE** (Settings → Security → Services), then switch to Remote mode.
+- **UR7e:** connected by Ethernet to the PC, on the same subnet. On the teach pendant:
+  - enable **Remote Control** (Settings → System → Remote Control), then switch the Local/Remote toggle at the top right to **Remote**; this lets the PC command the robot;
+  - make sure the **RTDE** service is not disabled (Settings → Security → Services); `ur_rtde` uses it to read and move the arm.
+
+  Menu names vary slightly between PolyScope versions.
 - **Sharpa Wave:** connected as its own documentation says, with **Sharpa Pilot** installed. Pilot installs the hand's Python SDK in `/opt/sharpa-wave-sdk/`.
-- **2× D435i:** a USB 3 cable each. `rs-enumerate-devices` lists their serial numbers.
+- **2× D435i:** a USB 3 cable each. After installing, list their serial numbers with
+  `python -c "import pyrealsense2 as rs; print([d.get_info(rs.camera_info.serial_number) for d in rs.context().devices])"`.
+- Read access to both GitHub repos (`latent-action-world-model`, `lawm-deployment`).
 
 ## Install (once)
 ```bash
@@ -41,7 +47,7 @@ Use the joint order of `assets/sharpa_wave/right_hand.xml` (thumb first, then in
 **2. Fill in `configs/real.yaml`.** Every line marked `CHANGE`:
 - the robot's IP address;
 - how the hand is mounted on the flange;
-- the camera serials, each with a rough tape-measured position and a point it looks at (metres, in the robot base frame);
+- the camera serials (keep them in quotes), each with a rough tape-measured position and a point it looks at (metres, in the robot base frame);
 - the box the flange may move in;
 - the table height.
 
@@ -51,7 +57,7 @@ Use the joint order of `assets/sharpa_wave/right_hand.xml` (thumb first, then in
   ```bash
   python -m lawm_deploy.calibrate --config configs/real.yaml
   ```
-  It switches the arm to freedrive. Move it by hand to 5 different poses, with the hand in view of both cameras and 15 cm or more above the table, pressing Enter after each. It prints **OK** or **SUSPECT** per camera. On SUSPECT, re-measure the rough pose (it needs to be within about 3 cm and 5°) and run it again.
+  It switches the arm to freedrive. Move it by hand to 5 different poses, with the hand in view of both cameras and 15 cm or more above the table, pressing Enter after each. It prints, per camera, the share of the robot's points it could match and **OK** (over 70%) or **SUSPECT**. On SUSPECT, re-measure the rough pose (it needs to be within about 3 cm and 5°) and run it again.
 
 **4. Check everything without the model.**
 ```bash
@@ -119,6 +125,50 @@ For a trial in simulation:
 3. Press **Run**.
 
 Each run saves `video.mp4` in its run folder.
+
+## How the code fits together
+
+One replan, start to end:
+```
+cell.state() ──> joint angles, flange pose ──> hand.py: 1024 hand points (FK on the Sharpa mesh)
+cell.views() ──> 2 depth images ──> perception.py: base-frame points, box crop, robot removed, 1.5 cm voxels, 5120 points
+                                         │
+                hand + scene cloud ──────┴──> model.py: rotate into the training frame ──> lawm planner (CEM over latent actions,
+                                              cost against the goal hand) ──> predicted step 1 of the hand points
+                                                                                   │
+safety.py <── hand.py: fit palm pose + 22 angles to those points <─────────────────┘
+   │  executor: flange target (step ≤ 60 mm, rotation smoothed); checks: fit, IK, jumps, box, floor ──> hold if any fails
+   └──> cell.move(): moveL for the arm + smooth finger targets ──> observe again
+```
+
+```
+lawm-deployment/
+├── README.md
+├── pyproject.toml               dependencies (pip install -e ".[real,dev]")
+├── configs/
+│   ├── real.yaml                every setting for the real cell (CHANGE lines must be set)
+│   ├── sim.yaml                 the same for the MuJoCo copy of the cell
+│   └── calibration.yaml         camera extrinsics (yours, or written by calibrate.py; not in git)
+├── checkpoint/                  best.pt (model), run_manifest.json (its settings), prior.npz (latent prior)
+├── assets/                      Sharpa Wave right hand and UR5e models (MuJoCo Menagerie)
+├── lawm_deploy/
+│   ├── __main__.py              python -m lawm_deploy: connects the cell, loads the model, serves the page
+│   ├── ui.py                    the browser page (viser): workspace box, captures, Plan/Step/Run/Stop, teleop, sim panel
+│   ├── session.py               one experiment: capture goal/start, the replan loop, stop rules, logs in runs/
+│   ├── perception.py            depth images -> hand + scene cloud
+│   ├── hand.py                  Sharpa hand points from joint angles, and the fit of angles to points
+│   ├── robot_model.py           UR + Sharpa kinematics (flange, palm, surface points to mask the robot)
+│   ├── model.py                 loads the checkpoint + prior, training-frame rotation, stand-in model for tests
+│   ├── safety.py                predicted hand -> flange/finger command, and the checks that hold the robot
+│   ├── cell.py                  real hardware: UR (ur_rtde), Sharpa (SharpaHand: fill in), D435i (pyrealsense2)
+│   ├── sim_cell.py              MuJoCo copy of the cell with simulated depth cameras and video recording
+│   ├── calibrate.py             camera extrinsics by matching depth points to the robot's own surface
+│   ├── config.py                reads the YAML configs
+│   └── sim_demo.py              one example run in simulation without the page
+├── tests/                       pytest (CPU): kinematics, perception, safety, calibration, loop, real cell on fakes
+└── runs/                        logs and videos of every run (created when you run; send these back)
+```
+The planner itself (search, costs, grasp hover gate, hand fit) lives in `latent-action-world-model` under `src/lawm/sim/dexwm/`; this repo only calls it.
 
 ## Credits
 - Robot models: [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Sharpa Wave: Apache-2.0; UR5e: BSD-3-Clause; licences in `assets/`).

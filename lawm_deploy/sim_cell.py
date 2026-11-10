@@ -1,6 +1,8 @@
 """A MuJoCo stand-in of the real cell: the same robot on a table with objects and two depth cameras at D435i resolution, behind the RealCell interface, plus a video camera that records the moves."""
 from __future__ import annotations
 
+import threading
+
 import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -58,6 +60,7 @@ class SimCell:
         v = cfg["video"]
         self.video = mujoco.Renderer(self.model, v["height"], v["width"])
         self.writer, self.frame, self.markers, self.next_frame = None, None, np.zeros((0, 3)), 0.0
+        self.stop_requested = threading.Event()  # set by the page's Stop; the moving thread itself stops
         self.rng = np.random.default_rng(seed)
         self.dt = self.model.opt.timestep
         self.set_state(np.radians(cfg["home_deg"]), np.zeros(22), [o["pos"] for o in cfg["objects"]])
@@ -160,6 +163,9 @@ class SimCell:
         control_dt = 1.0 / self.motion.finger_rate_hz
         q_cmd = q_arm.copy()
         for k in range(1, int(np.ceil(duration / control_dt)) + 1):
+            if self.stop_requested.is_set():
+                self.stop()
+                break
             s = min_jerk(k * control_dt / duration)
             way = pose((Rotation.from_rotvec(s * rel) * r0).as_matrix(), flange[:3, 3] + s * (target[:3, 3] - flange[:3, 3]))
             q_ik = self.ik(way, q_cmd)

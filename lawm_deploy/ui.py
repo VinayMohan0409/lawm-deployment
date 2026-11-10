@@ -48,7 +48,7 @@ class App:
     def __init__(self, session, config_path, port, sim_cell=None):
         """Build the page; sim_cell adds the sim-only jog controls."""
         self.session, self.config_path, self.sim = session, config_path, sim_cell
-        self.lock, self.stop_flag, self.task_ready = threading.Lock(), threading.Event(), None
+        self.lock, self.stop_flag, self.task_ready, self.reverting = threading.Lock(), threading.Event(), None, False
         self.server = viser.ViserServer(port=port)
         self.scene, gui = self.server.scene, self.server.gui
         p = session.perception.s
@@ -66,14 +66,14 @@ class App:
                 gui.add_markdown("**Teleoperation:** tick Teleoperation mode to hand the robot to your teleop system; the view and captures keep working. Untick it before Plan, Step or Run.  \n"
                                  "**By hand:** tick Freedrive to move the arm, untick to hold it, and set the fingers with the slider.")
                 self.teleop = gui.add_checkbox("Teleoperation mode (release the robot)", False)
-                self.teleop.on_update(lambda _: self.background(lambda: self.set_teleop(self.teleop.value)))
+                self.teleop.on_update(lambda _: self.toggle(self.teleop, self.set_teleop))
                 self.free = gui.add_checkbox("Freedrive (arm)", False)
-                self.free.on_update(lambda _: self.background(lambda: self.set_freedrive(self.free.value)))
+                self.free.on_update(lambda _: self.toggle(self.free, self.set_freedrive))
                 self.real_closure = gui.add_slider("finger closure", 0.0, 1.0, 0.05, 0.0)
                 gui.add_button("Set fingers").on_click(lambda _: self.background(self.set_fingers))
         with gui.add_folder("2. Goal, then start"):
-            gui.add_button("Capture goal").on_click(lambda _: self.capture("goal"))
-            gui.add_button("Capture start").on_click(lambda _: self.capture("start"))
+            gui.add_button("Capture goal").on_click(lambda _: self.background(lambda: self.capture("goal")))
+            gui.add_button("Capture start").on_click(lambda _: self.background(lambda: self.capture("start")))
             self.show_goal = gui.add_checkbox("Show goal hand", True)
             self.show_goal_scene = gui.add_checkbox("Show goal scene", False)
             self.show_start = gui.add_checkbox("Show start hand", True)
@@ -148,13 +148,16 @@ class App:
             self.scene.add_point_cloud("/start/hand", self.session.start.coords[hand], PURPLE, point_size=0.004, point_shape="rounded", visible=self.show_start.value)
 
     def refresh(self):
-        """Observe now and draw it, with the point counts."""
-        with self.lock:
-            try:
-                obs = self.session.observe()
-            except Exception as e:  # show perception problems on the page instead of crashing
-                self.counts.content = f"**{type(e).__name__}:** {e}"
-                return None
+        """Observe now and draw it, with the point counts (skipped while an action holds the robot)."""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            obs = self.session.observe()
+        except Exception as e:  # show perception problems on the page instead of crashing
+            self.counts.content = f"**{type(e).__name__}:** {e}"
+            return None
+        finally:
+            self.lock.release()
         self.draw("/current", obs, BLUE, GRAY)
         raw = self.session.perception.scene_points(obs.views, np.zeros((0, 3)))  # robot not removed
         self.scene.add_point_cloud("/raw", raw, RED, point_size=0.003, point_shape="rounded", visible=self.show_raw.value)
@@ -163,37 +166,64 @@ class App:
         return obs
 
     def capture(self, which):
-        """Capture the goal or the start and show it."""
-        with self.lock:
-            try:
-                getattr(self.session, f"capture_{which}")()
-            except Exception as e:
-                self.status.content = f"**Capture failed:** {e}"
-                return
+        """Capture the goal or the start and show it (called with the lock held)."""
+        getattr(self.session, f"capture_{which}")()
         self.task_ready = None
-        g, s = self.session.goal is not None, self.session.current is not None
+        g, s = self.session.goal is not None, self.session.start is not None
         self.captured.content = f"Goal: {'captured' if g else 'none'}. Start: {'captured' if s else 'none'}. Log: `{self.session.log}`"
         self.draw_goal()
         self.draw_start()
-        if self.session.current is not None:
-            self.draw("/current", self.session.current, BLUE, GRAY)
+        self.draw("/current", self.session.current, BLUE, GRAY)
 
-    def background(self, fn):
-        """Run fn in a thread unless something else holds the cell."""
-        if self.lock.locked():
-            self.status.content = "Busy: wait or press Stop."
+    def background(self, fn, on_reject=None):
+        """Run fn in a thread that holds the robot lock; refused (on_reject called) while another action holds it; errors are shown on the page and the robot is stopped."""
+        if not self.lock.acquire(blocking=False):
+            self.status.content = "Busy: wait for the current action to finish, or press Stop."
+            if on_reject is not None:
+                on_reject()
             return
-        threading.Thread(target=fn, daemon=True).start()
+        self.stop_flag.clear()
+        self.session.cell.stop_requested.clear()
 
-    def ready(self):
-        """Set up the planner if the task or the captures changed; False with a message if goal or start is missing or the robot is released."""
+        def work():
+            """fn, with errors reported and the lock always released."""
+            try:
+                fn()
+            except Exception as e:
+                self.status.content = f"**Error ({type(e).__name__}):** {e}"
+                try:
+                    self.session.cell.stop()
+                except Exception:
+                    pass
+            finally:
+                self.lock.release()
+        threading.Thread(target=work, daemon=True).start()
+
+    def toggle(self, box, apply):
+        """A checkbox that changes the robot's mode: applied in the background, flipped back if refused."""
+        if self.reverting:
+            return
+        value = box.value
+
+        def revert():
+            """Show the box as it was."""
+            self.reverting = True
+            box.value = not value
+            self.reverting = False
+        self.background(lambda: apply(value), on_reject=revert)
+
+    def ready(self, new_run=False):
+        """Start a run (new_run, a new task or captures, or the last run ended); False with a message if the goal or start is missing or the robot is released or in freedrive."""
         if getattr(self.session.cell, "released", False):
             self.status.content = "The robot is released (Teleoperation mode): untick it first."
             return False
-        if self.session.goal is None or self.session.current is None:
+        if getattr(self.session.cell, "teach", False):
+            self.status.content = "Freedrive is on: untick it first."
+            return False
+        if self.session.goal is None or self.session.start is None:
             self.status.content = "Capture the goal, then the start."
             return False
-        if self.task_ready != self.task.value:
+        if new_run or self.task_ready != self.task.value or self.session.finished:
             self.session.begin(self.task.value)
             self.task_ready = self.task.value
         return True
@@ -206,56 +236,53 @@ class App:
         if self.sim is not None:
             self.video_frame.image = self.sim.frame
             self.video_path.content = f"Recording to `{self.session.run_dir / 'video.mp4'}` (complete when the run ends)."
-        self.status.content = (f"Replan {record['replan']}: distance {record['distance_mm']:.1f} mm, {'moved' if record['moved'] else 'held' if record['hold'] else 'planned, no motion'}"
+        what = "planned only (no motion)" if record.get("plan_only") else "moved" if record["moved"] else "held"
+        self.status.content = (f"Replan {record['replan']}: distance {record['distance_mm']:.1f} mm, {what}"
                                f"{' (' + record['hold'] + ')' if record['hold'] else ''}, fit {record['fit_residual_mm']:.1f} mm, within {self.session.loop.success_mm:.0f} mm of the goal for {record['within_success']}/{self.session.loop.success_replans} replans."
                                f"{' **Stop: ' + record['stop'] + '**' if record['stop'] else ''}")
 
     def plan_only(self):
-        """One replan without motion; the orange hand shows where it would move."""
-        with self.lock:
-            if self.ready():
-                self.show(self.session.step(execute=False))
+        """One plan without motion; the orange hand shows where it would move."""
+        if self.ready():
+            self.show(self.session.step(execute=False))
 
     def one_step(self):
         """One replan with motion."""
-        with self.lock:
-            if self.ready():
-                self.show(self.session.step(execute=True))
+        if self.ready():
+            self.show(self.session.step(execute=True))
+            if self.session.finished:
+                self.session.finish()
 
     def run(self):
-        """Replan and move until a stop condition or Stop."""
-        self.stop_flag.clear()
-        with self.lock:
-            if self.ready():
-                reason = self.session.run(execute=True, should_stop=self.stop_flag.is_set, on_step=self.show)
-                self.status.content += f"  \nRun ended: **{reason}**. Logs: `{self.session.run_dir}`"
+        """A new run: replan and move until a stop condition or Stop."""
+        if self.ready(new_run=True):
+            reason = self.session.run(execute=True, should_stop=self.stop_flag.is_set, on_step=self.show)
+            self.status.content += f"  \nRun ended: **{reason}**. Logs: `{self.session.run_dir}`"
 
     def stop(self):
-        """Stop after the current move and hold the robot."""
+        """Stop: the moving thread halts the arm and fingers now, and the run ends after this replan."""
         self.stop_flag.set()
-        self.session.cell.stop()
-        self.status.content = "Stopping after the current move."
+        self.session.cell.stop_requested.set()
+        self.status.content = "Stopping."
 
     def sim_move(self):
         """Sim only: move the flange by the jog offsets from home and close the fingers by the slider."""
         q = self.closure_angles(self.closure.value)
         target = self.home.copy()
         target[:3, 3] += [j.value for j in self.jog]
-        with self.lock:
-            if self.arrange.value:
-                q_arm = self.sim.ik(target, self.sim.state()[0])
-                if q_arm is None:
-                    self.status.content = "No IK solution for that pose."
-                    return
-                self.sim.set_state(q_arm, q, self.sim.object_positions())
-            else:
-                self.sim.move(target, q)
+        if self.arrange.value:
+            q_arm = self.sim.ik(target, self.sim.state()[0])
+            if q_arm is None:
+                self.status.content = "No IK solution for that pose."
+                return
+            self.sim.set_state(q_arm, q, self.sim.object_positions())
+        else:
+            self.sim.move(target, q)
         self.video_frame.image = self.sim.render_frame()
 
     def sim_reset(self):
         """Sim only: robot at home with the hand open, objects back where the config has them."""
-        with self.lock:
-            self.sim.set_state(np.radians(self.sim.cfg["home_deg"]), np.zeros(22), [o["pos"] for o in self.sim.cfg["objects"]])
+        self.sim.set_state(np.radians(self.sim.cfg["home_deg"]), np.zeros(22), [o["pos"] for o in self.sim.cfg["objects"]])
         for j in self.jog:
             j.value = 0.0
         self.closure.value, self.arrange.value = 0.0, False
@@ -277,23 +304,20 @@ class App:
 
     def set_teleop(self, on):
         """Real robot: release it to a teleoperation system, or take control back."""
-        with self.lock:
-            self.session.cell.release() if on else self.session.cell.take_control()
+        self.session.cell.release() if on else self.session.cell.take_control()
         self.status.content = "Teleoperation mode: the robot is released; the live view follows it." if on else "Control taken back: Plan, Step and Run are available."
 
     def set_freedrive(self, on):
         """Real robot: arm teach mode on or off."""
-        with self.lock:
-            self.session.cell.freedrive(on)
+        self.session.cell.freedrive(on)
         self.status.content = "Freedrive on: move the arm by hand." if on else "Freedrive off: the arm holds."
 
     def set_fingers(self):
         """Move only the fingers to the slider's closure, the arm where it is."""
-        with self.lock:
-            if getattr(self, "free", None) is not None and self.free.value:
-                self.status.content = "Untick Freedrive first."
-                return
-            self.session.cell.move(self.session.cell.state()[2], self.closure_angles(self.real_closure.value))
+        if getattr(self.session.cell, "teach", False):
+            self.status.content = "Untick Freedrive first."
+            return
+        self.session.cell.move(self.session.cell.state()[2], self.closure_angles(self.real_closure.value))
 
     def check_frame(self):
         """For 8 spins of the model frame, the model's mean predicted motion (5 steps, 32 prior samples) of the hand and of the scene on the current view."""
@@ -301,22 +325,21 @@ class App:
         if not isinstance(self.session.model, FramedModel):
             self.frame_report.content = "Only with the real model."
             return
-        with self.lock:
-            obs = self.session.observe()
-            inner, m = self.session.model.inner, self.session.cfg["model"]
-            mean, std = inner.prior
-            z = (mean[None] + std[None] * np.random.default_rng(0).normal(size=(32, *mean.shape))).astype(np.float32)
-            hand = obs.segment == SEG_HAND
-            rows = []
-            for spin in range(0, 360, 45):
-                d = FramedModel(inner, model_frame(m["training_up"], spin)).decoder(obs.coords, obs.segment)(z)
-                motion = np.linalg.norm(d[:, -1], axis=-1).mean(0) * 1000
-                rows.append(f"| {spin}{' (now)' if spin == m['spin_deg'] else ''} | {motion[hand].mean():.1f} | {motion[~hand].mean():.1f} |")
+        obs = self.session.observe()
+        inner, m = self.session.model.inner, self.session.cfg["model"]
+        mean, std = inner.prior
+        z = (mean[None] + std[None] * np.random.default_rng(0).normal(size=(32, *mean.shape))).astype(np.float32)
+        hand = obs.segment == SEG_HAND
+        rows = []
+        for spin in range(0, 360, 45):
+            d = FramedModel(inner, model_frame(m["training_up"], spin)).decoder(obs.coords, obs.segment)(z)
+            motion = np.linalg.norm(d[:, -1], axis=-1).mean(0) * 1000
+            rows.append(f"| {spin}{' (now)' if spin == m['spin_deg'] else ''} | {motion[hand].mean():.1f} | {motion[~hand].mean():.1f} |")
         self.frame_report.content = "| spin (deg) | hand (mm) | scene (mm) |\n|---|---|---|\n" + "\n".join(rows)
 
     def serve(self):
-        """Keep the live view fresh while idle, forever."""
+        """Keep the live view fresh while idle, until Ctrl+C."""
         while True:
-            if self.live.value and not self.lock.locked():
+            if self.live.value:
                 self.refresh()
             time.sleep(1.0)
