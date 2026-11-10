@@ -1,0 +1,64 @@
+# Real cell: UR7e + Sharpa Wave (right) + 2x RealSense D435i. Every line marked CHANGE must be set before the first run.
+seed: 0
+log_dir: runs
+
+model:
+  checkpoint: checkpoint/best.pt
+  manifest: checkpoint/run_manifest.json
+  prior: checkpoint/prior.npz
+
+mount: {xyz_m: [0.0, 0.0, 0.0], rpy_deg: [0.0, 0.0, 0.0]}   # CHANGE: hand base (MJCF origin) in the UR flange frame, from the adapter drawing
+
+cell:
+  type: real
+  robot_ip: 192.168.1.10          # CHANGE: the UR control box
+  sharpa: {}                      # CHANGE: whatever the Sharpa SDK needs to connect (see README, "Sharpa hand")
+  cameras:
+    width: 848
+    height: 480
+    fps: 30
+    n_frames: 5                   # each view = per-pixel median of this many frames
+    preset: 3                     # RealSense visual preset (3 = High Accuracy); null = leave as is
+    calibration: configs/calibration.yaml   # written by python -m lawm_deploy.calibrate
+    devices:                      # CHANGE: serials (rs-enumerate-devices) and a tape-measured pose: eye = camera position, target = a point it looks at (m, robot base frame)
+      - {serial: "CHANGE", rough_eye: [0.95, -0.45, 0.60], rough_target: [0.5, 0.15, 0.05]}
+      - {serial: "CHANGE", rough_eye: [0.95, 0.75, 0.60], rough_target: [0.5, 0.15, 0.05]}
+  motion: {speed: 0.05, accel: 0.25, rot_speed: 0.3, finger_speed: 0.5, min_move_s: 0.5, finger_rate_hz: 100, settle_s: 0.3}   # start slow; raise once moves look right
+
+perception:
+  near_m: 0.2
+  far_m: 2.0
+  use_box: true                    # crop to the workspace box (false: everything the cameras see within near..far)
+  box_lo: [0.15, -0.35, -0.05]     # CHANGE (in the UI): workspace box (m, base frame), fixed before any trial
+  box_hi: [0.85, 0.65, 0.45]
+  robot_margin_m: 0.015            # camera points this close to the arm/hand surface (FK) are dropped
+  voxel_m: 0.015                   # one camera point per 1.5 cm voxel (PointWorld's grid)
+  n_hand: 1024                     # Sharpa mesh points
+  n_scene: 5120                    # camera points per frame: random subsample above, repeats below (6144 total fits an 11 GB GPU)
+  min_scene_points: 500
+
+safety:
+  max_step_mm: 60.0                # lawm's DexWM value
+  ori_alpha: 0.5                   # lawm's DexWM value
+  max_rot_deg: 30.0                # hold if one replan would turn the wrist more than this
+  max_finger_deg: 60.0             # hold if one replan would move a finger joint more than this
+  max_joint_deg: 30.0              # hold if the UR's IK solution jumps an arm joint more than this (wrist flips)
+  max_fit_residual_mm: 15.0        # hold if the hand fit is worse than this
+  box_lo: [0.15, -0.4, 0.05]       # CHANGE: the flange may only be commanded inside this box (m, base frame)
+  box_hi: [0.9, 0.7, 0.7]
+  floor_z_m: 0.0                   # CHANGE: no commanded hand point below this height (m, base frame): the table height plus a few mm
+
+# Planner: lawm's configs/stage3/dexwm.json, unchanged (reach and grasp; place needs object labels).
+planner:
+  cem:
+    reach: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
+    grasp: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
+  weights:
+    reach: {hand_scale: 1.0, fingertip: 2.0, object_still: 1.0}
+    grasp: {hand_scale: 1.0, fingertip: 2.0}
+  gates:
+    hover: {margin_mm: 200.0, proximity_mm: 50.0, replan_cap: 40}   # grasp first aims 20 cm above the goal hand; lower if the workspace is short
+
+loop:
+  reach: {max_replans: 80, converge_mm: 10.0, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
+  grasp: {max_replans: 80, converge_mm: 10.0, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}

@@ -1,0 +1,17 @@
+[project]
+name = "lawm-deploy"
+version = "0.1.0"
+description = "Real-world deployment of the latent action world model on a UR7e + Sharpa Wave hand with two RealSense D435i cameras."
+requires-python = ">=3.10"
+# The model (torch, spconv, torch_scatter) and lawm itself are installed as the README says; they are not pip-resolvable here.
+dependencies = ["numpy<2", "scipy", "mujoco==3.2.6", "pyyaml", "viser"]
+
+[project.optional-dependencies]
+real = ["ur_rtde", "pyrealsense2"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["lawm_deploy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
