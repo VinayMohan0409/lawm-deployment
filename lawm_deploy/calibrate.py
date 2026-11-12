@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import time
 import warnings
-from pathlib import Path
 
 import numpy as np
 import yaml
@@ -86,16 +85,21 @@ def main():
     parser.add_argument("--poses", type=int, default=5)
     args = parser.parse_args()
     cfg = config.load(args.config)
-    cell = RealCell(cfg["cell"], hand_spec()[1], calibrated=False)
     robot = RobotModel(config.mount_pose(cfg), n_mask_points=100000)
     frames = []
-    for k in range(args.poses):
-        cell.freedrive(True)
-        input(f"Pose {k + 1}/{args.poses}: move the arm by hand to a new pose with the hand and forearm in view of both cameras, let go, press Enter. ")
-        cell.freedrive(False)
-        time.sleep(1.0)
-        q_arm, q_hand, _ = cell.state()
-        frames.append((q_arm, q_hand, cell.views()))
+    cell = RealCell(cfg["cell"], hand_spec()[1], calibrated=False)
+    try:
+        for k in range(args.poses):
+            input(f"Pose {k + 1}/{args.poses}: use the pendant to arrange the arm, END pendant freedrive and let it hold still, then press Enter. This tool is read-only. ")
+            time.sleep(1.0)
+            q_arm, q_hand, _ = cell.state()
+            views = cell.views()
+            qa, qh, _ = cell.state()
+            if np.max(np.abs(qa-q_arm)) > 0.01 or np.max(np.abs(qh-q_hand)) > 0.03:
+                raise RuntimeError("Robot moved during calibration capture")
+            frames.append((q_arm, q_hand, views))
+    finally:
+        cell.close()
     results = calibrate(robot, frames, camera_poses(cfg["cell"]["cameras"], calibrated=False))
     out = {}
     for d, (T, residual, share) in zip(cfg["cell"]["cameras"]["devices"], results):
@@ -103,9 +107,15 @@ def main():
         print(f"camera {d['serial']}: {share:.0%} of the moving (robot) points matched within 5 mm, median {residual:.1f} mm -> {verdict}")
         out[str(d["serial"])] = np.round(T, 6).tolist()
     path = config.repo_path(cfg["cell"]["cameras"]["calibration"])
-    path.write_text(f"# camera optical-frame poses in the robot base frame, written by lawm_deploy.calibrate on {time.strftime('%Y-%m-%d %H:%M')}\n" + yaml.safe_dump(out))
+    # Do not silently replace a previous calibration, or accept a failed ICP fit.
+    if any(share <= 0.7 for _, _, share in results):
+        raise RuntimeError("Calibration SUSPECT; not writing calibration.yaml")
+    if path.exists():
+        raise FileExistsError(f"Preserve/review the existing calibration before replacing {path}")
+    path.write_text(yaml.safe_dump(dict(frame="depth_optical", T_base_camera=out,
+                                      provenance=f"robot-surface ICP {time.strftime('%Y-%m-%d %H:%M')}",
+                                      physical_validation="PENDING")))
     print(f"written to {path}")
-    cell.close()
 
 
 if __name__ == "__main__":

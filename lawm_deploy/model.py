@@ -54,6 +54,8 @@ def load_model(cfg):
 
     from lawm.sim import model_adapter
     from lawm_deploy.config import repo_path
+    from lawm_deploy.model_contract import validate_model_contract
+    validate_model_contract(cfg)
     m = cfg["model"]
     checkpoint = repo_path(m["checkpoint"])
     model = model_adapter.load_model(checkpoint, repo_path(m["manifest"]), torch.device("cuda"))

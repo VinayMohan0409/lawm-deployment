@@ -6,9 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from lawm.sim.dexwm.control.hand_fit import hand_state_to_action
-
 from lawm_deploy.robot_model import pose
+from lawm_deploy.hardware_contract import HardwareError, transform, vector
 
 
 @dataclass(frozen=True)
@@ -36,6 +35,9 @@ class Executor:
 
     def command(self, root_rot, root_pos, q, root_now, flange_now):
         """(4x4 flange target, 22 finger targets, unclipped translation in mm); the smoothing state only changes once the target is sent (sent())."""
+        from lawm.sim.dexwm.control.hand_fit import hand_state_to_action
+        transform(pose(root_rot, vector(root_pos, 3, "fitted root")), "fitted root")
+        vector(q, 22, "fitted hand")
         pos, rotvec, fingers = hand_state_to_action(root_rot, root_pos, q, root_now[:3, :3], root_now[:3, 3], flange_now[:3, 3], flange_now[:3, :3])
         keys = Rotation.concatenate([Rotation.from_rotvec(self.last_rotvec), Rotation.from_rotvec(rotvec)])
         rotvec = Slerp([0, 1], keys)([self.s.ori_alpha])[0].as_rotvec()
@@ -53,13 +55,23 @@ class Executor:
 def check(settings, target, q_hand, q_hand_now, flange_now, q_arm_now, q_arm_ik, fit_info, hand_points):
     """None if the command is safe to send, else the reason to hold: bad fit, no IK or a joint jump, a large rotation or finger jump, the flange outside the box, a hand point below the floor height."""
     s = settings
+    try:
+        transform(target, "target")
+        transform(flange_now, "measured flange")
+        vector(q_hand, 22, "hand target")
+        vector(q_hand_now, 22, "measured hand")
+        vector(q_arm_now, 6, "measured arm")
+        if q_arm_ik is not None:
+            vector(q_arm_ik, 6, "arm IK")
+        points = np.asarray(hand_points)
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points) or not np.isfinite(points).all():
+            return "invalid/nonfinite hand points"
+        if not np.isfinite(fit_info["mean_residual_mm"]):
+            return "invalid/nonfinite fit residual"
+    except (HardwareError, ValueError, KeyError, TypeError) as error:
+        return str(error)
     if fit_info["mean_residual_mm"] > s.max_fit_residual_mm:
         return f"hand fit residual {fit_info['mean_residual_mm']:.1f} mm > {s.max_fit_residual_mm}"
-    if q_arm_ik is None:
-        return "no arm IK solution for the target"
-    jump = float(np.degrees(np.abs(np.asarray(q_arm_ik) - q_arm_now).max()))
-    if jump > s.max_joint_deg:
-        return f"arm joint jump {jump:.1f} deg > {s.max_joint_deg}"
     rot = float(np.degrees(Rotation.from_matrix(target[:3, :3] @ flange_now[:3, :3].T).magnitude()))
     if rot > s.max_rot_deg:
         return f"wrist rotation {rot:.1f} deg > {s.max_rot_deg}"
@@ -71,4 +83,11 @@ def check(settings, target, q_hand, q_hand_now, flange_now, q_arm_now, q_arm_ik,
     low = float(hand_points[:, 2].min())
     if low < s.floor_z_m:
         return f"hand reaches z = {low * 1000:.0f} mm, below the floor height {s.floor_z_m * 1000:.0f} mm"
+    # Report checks available from the observed geometry even when read-only
+    # operation deliberately skips controller IK.
+    if q_arm_ik is None:
+        return "no arm IK solution for the target"
+    jump = float(np.degrees(np.abs(np.asarray(q_arm_ik) - q_arm_now).max()))
+    if jump > s.max_joint_deg:
+        return f"arm joint jump {jump:.1f} deg > {s.max_joint_deg}"
     return None

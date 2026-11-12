@@ -7,6 +7,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from lawm.sim.costs import SEG_HAND, SEG_OBJECT
+from lawm_deploy.observation_io import back_project
 
 SEG_SCENE = SEG_OBJECT  # every camera point gets one label (no object/table split); lawm's costs read it as the object
 
@@ -29,14 +30,6 @@ class PerceptionSettings:
     n_hand: int
     n_scene: int
     min_scene_points: int
-
-
-def back_project(depth, K, cam_pose, near, far):
-    """Base-frame points (n, 3) of the valid pixels of a depth image (m) with intrinsics K and the 4x4 pose of the optical frame (x right, y down, z forward)."""
-    v, u = np.nonzero((depth > near) & (depth < far))
-    z = depth[v, u]
-    cam = np.stack([(u - K[0, 2]) * z / K[0, 0], (v - K[1, 2]) * z / K[1, 1], z], axis=1)
-    return cam @ cam_pose[:3, :3].T + cam_pose[:3, 3]
 
 
 def voxel_down(points, size):

@@ -29,6 +29,16 @@ def test_checks():
     assert "box" in check(S, pose(FLANGE[:3, :3], [2.0, 0, 0.5]), **GOOD)
 
 
+def test_missing_ik_does_not_hide_other_rejections():
+    from scipy.spatial.transform import Rotation
+    unknown_ik = {**GOOD, 'q_arm_ik': None}
+    turned = pose(Rotation.from_euler('z', 40, degrees=True).as_matrix() @ FLANGE[:3, :3], FLANGE[:3, 3])
+    assert 'wrist rotation' in check(S, turned, **unknown_ik)
+    assert 'finger' in check(S, FLANGE, **{**unknown_ik, 'q_hand': np.full(22, 1.5)})
+    assert 'floor' in check(S, FLANGE, **{**unknown_ik, 'hand_points': np.array([[0., 0., -.01]])})
+    assert 'IK' in check(S, FLANGE, **unknown_ik)
+
+
 def test_model_frame_round_trip():
     """The training-frame rotation is a proper rotation taking z to the training up, and the wrapped model's displacements come back in the base frame."""
     from lawm_deploy.model import FramedModel, StandInModel, model_frame

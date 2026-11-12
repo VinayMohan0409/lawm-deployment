@@ -49,6 +49,8 @@ class App:
         """Build the page; sim_cell adds the sim-only jog controls."""
         self.session, self.config_path, self.sim = session, config_path, sim_cell
         self.lock, self.stop_flag, self.task_ready, self.reverting = threading.Lock(), threading.Event(), None, False
+        self.worker = None
+        self.closing = False
         self.server = viser.ViserServer(port=port)
         self.scene, gui = self.server.scene, self.server.gui
         p = session.perception.s
@@ -61,9 +63,17 @@ class App:
             self.show_raw = gui.add_checkbox("Show raw camera points", False, hint="Overlay check: red camera points on the arm and hand should sit on the blue mesh hand")
             gui.add_button("Save box to config").on_click(lambda _: self.save())
             self.counts = gui.add_markdown("")
-        if hasattr(session.cell, "freedrive"):  # real robot: arrange it by teleoperation or by hand
+        if getattr(session.cell, "read_only", False):
+            gui.add_markdown("**Read-only:** Plan only is available. No UR control script or hand targets. Controller IK is not checked. Restart with --execute only after site commissioning.")
+        trial_step = getattr(session.cell, 'trial_step', False)
+        if trial_step:
+            gui.add_markdown('**Single-step trial:** existing setup accepted for this test; physical checks remain unverified. Step permits one move attempt. Run and manual jog are disabled.')
+        trial_run = getattr(session.cell, 'trial_run', False)
+        if trial_run:
+            gui.add_markdown('**Closed-loop trial:** Run observes, plans and executes one move repeatedly. Stop ends the run. Existing setup is accepted for this test; physical checks remain unverified.')
+        if hasattr(session.cell, "freedrive") and not getattr(session.cell, "read_only", False) and not (trial_step or trial_run):
             with gui.add_folder("Arrange the robot"):
-                gui.add_markdown("**Teleoperation:** tick Teleoperation mode to hand the robot to your teleop system; the view and captures keep working. Untick it before Plan, Step or Run.  \n"
+                gui.add_markdown("**Teleoperation:** release disconnects the UR controller and Sharpa SDK. Stop teleop and take control back before captures; simultaneous Sharpa readers are not assumed.  \n"
                                  "**By hand:** tick Freedrive to move the arm, untick to hold it, and set the fingers with the slider.")
                 self.teleop = gui.add_checkbox("Teleoperation mode (release the robot)", False)
                 self.teleop.on_update(lambda _: self.toggle(self.teleop, self.set_teleop))
@@ -77,19 +87,18 @@ class App:
             self.show_goal = gui.add_checkbox("Show goal hand", True)
             self.show_goal_scene = gui.add_checkbox("Show goal scene", False)
             self.show_start = gui.add_checkbox("Show start hand", True)
-            self.captured = gui.add_markdown("Goal: none. Start: none.")
+            self.captured = gui.add_markdown(
+                "Saved goal/start loaded. Start is a reference; every run observes the robot and scene again. No automatic return to start."
+                if session.goal is not None and session.start is not None else "Goal: none. Start: none.")
         with gui.add_folder("3. Run"):
-            self.task = gui.add_dropdown("Task", ("reach", "grasp"))
+            self.task = gui.add_dropdown("Task", ("reach", "grasp"), initial_value=session.cfg.get('experiment', {}).get('task', 'reach'))
             gui.add_button("Plan only (no motion)").on_click(lambda _: self.background(self.plan_only))
             gui.add_button("Step (one move)").on_click(lambda _: self.background(self.one_step))
-            gui.add_button("Run").on_click(lambda _: self.background(self.run))
+            gui.add_button("Run", disabled=trial_step).on_click(lambda _: self.background(self.run))
             gui.add_button("Stop", color="red").on_click(lambda _: self.stop())
             self.status = gui.add_markdown("Idle.")
             gui.add_markdown(LEGEND)
-        with gui.add_folder("4. Check model frame", expand_by_default=False):
-            gui.add_markdown("If Plan only keeps choosing hold, the model may be reading this layout in the wrong frame. This tries 8 spins on the current view: pick the one with the most hand motion and the least scene motion, and set `model.spin_deg` in the config (restart to apply). About a minute.")
-            gui.add_button("Check model frame").on_click(lambda _: self.background(self.check_frame))
-            self.frame_report = gui.add_markdown("")
+            gui.add_markdown("Success measures hand-goal distance only. Object grasp/lift success is evaluated separately from video.")
         if sim_cell is not None:
             with gui.add_folder("Simulation"):
                 with gui.add_folder("Place the robot"):
@@ -116,6 +125,8 @@ class App:
         self.task.on_update(lambda _: setattr(self, "task_ready", None))
         self.scene.add_frame("/base", axes_length=0.1, axes_radius=0.003)
         self.box_changed()
+        self.draw_goal()
+        self.draw_start()
 
     def box_changed(self):
         """Apply the box settings to perception and redraw the box."""
@@ -173,11 +184,11 @@ class App:
         self.captured.content = f"Goal: {'captured' if g else 'none'}. Start: {'captured' if s else 'none'}. Log: `{self.session.log}`"
         self.draw_goal()
         self.draw_start()
-        self.draw("/current", self.session.current, BLUE, GRAY)
+        self.draw("/current", getattr(self.session, which), BLUE, GRAY)
 
     def background(self, fn, on_reject=None):
         """Run fn in a thread that holds the robot lock; refused (on_reject called) while another action holds it; errors are shown on the page and the robot is stopped."""
-        if not self.lock.acquire(blocking=False):
+        if self.closing or not self.lock.acquire(blocking=False):
             self.status.content = "Busy: wait for the current action to finish, or press Stop."
             if on_reject is not None:
                 on_reject()
@@ -197,7 +208,8 @@ class App:
                     pass
             finally:
                 self.lock.release()
-        threading.Thread(target=work, daemon=True).start()
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
 
     def toggle(self, box, apply):
         """A checkbox that changes the robot's mode: applied in the background, flipped back if refused."""
@@ -212,8 +224,15 @@ class App:
             self.reverting = False
         self.background(lambda: apply(value), on_reject=revert)
 
-    def ready(self, new_run=False):
+    def ready(self, new_run=False, execute=True):
         """Start a run (new_run, a new task or captures, or the last run ended); False with a message if the goal or start is missing or the robot is released or in freedrive."""
+        if execute and getattr(self.session.cell, 'trial_step', False):
+            if new_run or self.session.cell.trial_attempted:
+                self.status.content = 'Single-step trial: Run is disabled; only one move attempt per launch. Review the saved result before restarting.'
+                return False
+        if execute and getattr(self.session.cell, "read_only", False):
+            self.status.content = "Read-only: use Plan only. Execution requires --execute and completed site checks."
+            return False
         if getattr(self.session.cell, "released", False):
             self.status.content = "The robot is released (Teleoperation mode): untick it first."
             return False
@@ -243,15 +262,16 @@ class App:
 
     def plan_only(self):
         """One plan without motion; the orange hand shows where it would move."""
-        if self.ready():
+        if self.ready(execute=False):
             self.show(self.session.step(execute=False))
 
     def one_step(self):
         """One replan with motion."""
         if self.ready():
             self.show(self.session.step(execute=True))
-            if self.session.finished:
-                self.session.finish()
+            if getattr(self.session.cell, 'trial_step', False) and self.session.cell.trial_attempted:
+                self.session.finish('trial step complete')
+                self.status.content += f'  \nSingle move completed. Further motion disabled. Logs: `{self.session.run_dir}`'
 
     def run(self):
         """A new run: replan and move until a stop condition or Stop."""
@@ -264,6 +284,28 @@ class App:
         self.stop_flag.set()
         self.session.cell.stop_requested.set()
         self.status.content = "Stopping."
+        # If idle (including freedrive), no worker will consume the stop flag.
+        if self.lock.acquire(blocking=False):
+            try:
+                self.session.cell.stop()
+                if self.session.run_dir is not None and not self.session.finished:
+                    self.session.finish('stopped by user')
+            finally:
+                self.lock.release()
+
+    def shutdown(self):
+        """Let the command owner stop before the main thread disconnects devices."""
+        self.closing = True
+        self.stop_flag.set()
+        self.session.cell.stop_requested.set()
+        if self.worker is not None:
+            self.worker.join(timeout=10.0)
+            if self.worker.is_alive():
+                print("Worker did not exit; avoiding concurrent RTDE calls. The motion watchdog remains the arm fallback; use pendant stop.")
+                return False
+        if self.session.run_dir is not None and not self.session.finished:
+            self.session.finish('application shutdown')
+        return True
 
     def sim_move(self):
         """Sim only: move the flange by the jog offsets from home and close the fingers by the slider."""
@@ -318,24 +360,6 @@ class App:
             self.status.content = "Untick Freedrive first."
             return
         self.session.cell.move(self.session.cell.state()[2], self.closure_angles(self.real_closure.value))
-
-    def check_frame(self):
-        """For 8 spins of the model frame, the model's mean predicted motion (5 steps, 32 prior samples) of the hand and of the scene on the current view."""
-        from lawm_deploy.model import FramedModel, model_frame
-        if not isinstance(self.session.model, FramedModel):
-            self.frame_report.content = "Only with the real model."
-            return
-        obs = self.session.observe()
-        inner, m = self.session.model.inner, self.session.cfg["model"]
-        mean, std = inner.prior
-        z = (mean[None] + std[None] * np.random.default_rng(0).normal(size=(32, *mean.shape))).astype(np.float32)
-        hand = obs.segment == SEG_HAND
-        rows = []
-        for spin in range(0, 360, 45):
-            d = FramedModel(inner, model_frame(m["training_up"], spin)).decoder(obs.coords, obs.segment)(z)
-            motion = np.linalg.norm(d[:, -1], axis=-1).mean(0) * 1000
-            rows.append(f"| {spin}{' (now)' if spin == m['spin_deg'] else ''} | {motion[hand].mean():.1f} | {motion[~hand].mean():.1f} |")
-        self.frame_report.content = "| spin (deg) | hand (mm) | scene (mm) |\n|---|---|---|\n" + "\n".join(rows)
 
     def serve(self):
         """Keep the live view fresh while idle, until Ctrl+C."""

@@ -1,5 +1,46 @@
 # lawm-deployment
 
+**Local UR7e/Sharpa integration:** see [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md) for the independent conda environment, SDK adapter and checks. Real hardware is read-only unless `--execute`, `--trial-step`, or `--trial-run` is supplied.
+
+**Continuous supervised trial (operator-authorized existing setup):**
+```bash
+CUDA_VISIBLE_DEVICES=1 ./run_lawm.sh --trial-run
+```
+Open `http://localhost:8080`, keep **reach**, click **Capture start**, then **Run**.
+The saved goal is loaded automatically; do not Capture goal again. Each cycle
+observes the current scene and joints, replans, fits the hand, checks IK and executes
+one move. Run repeats automatically until a stop condition (at most 80 replans
+with the current config); **Stop** ends it. Every replan is logged. This mode uses
+the same accepted existing setup, motion limits and runtime checks as `--trial-step`,
+without the one-attempt limit. Commissioning flags remain unchanged.
+
+**First supervised real move (operator-authorized existing setup):**
+```bash
+CUDA_VISIBLE_DEVICES=1 ./run_lawm.sh --trial-step
+```
+Open `http://localhost:8080`, keep **reach**, click **Capture start**, optionally
+**Plan only**, then **Step (one move)**. The saved goal is loaded automatically;
+do not Capture goal again. Step captures fresh state and replans, so its command
+can differ from the preceding preview. It performs IK/path checks before moving.
+Only one move attempt is allowed per launch; **Run** and manual jog are disabled.
+If it holds, nothing moved; inspect the stated reason. Stop the process after the
+trial and review its logs before another launch. This mode records acceptance of
+the existing setup (including existing payload) without claiming outstanding
+physical commissioning checks passed. It preserves runtime safety checks and
+caps of 10 mm translation, 8 degrees wrist, 20 degrees fingers, 10 degrees arm
+joint excursion and the existing slow motion settings. No automatic reset occurs.
+
+**Current local trial (2026-11-12):** `configs/real.yaml` loads
+`/data2/xuchuan/lawm_samples/grasp_20261111_171635` and selects **reach**.
+The saved goal is fixed; the saved start is a reference only. Every real run/replan
+captures current joints and depth. There is no automatic move back to the saved start.
+Run `./run_lawm.sh` for live observation and Plan only; `--no-sample-pair` selects
+fresh goal/start capture instead. Stop other hardware owners before connecting.
+Ordinary `--execute` requires completed commissioning; `--trial-run` records the
+operator-authorized experimental exception for the existing setup.
+Environment setup, calibration conventions, log contents and execution limits
+are described in [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md).
+
 Runs a world model (LAWM) on a **UR7e + right Sharpa Wave hand + two RealSense D435i cameras**.
 
 You set a goal pose and a start pose, pick **reach** or **grasp**, and press **Run**. On every replan the robot:
@@ -36,13 +77,8 @@ The model files are already in `checkpoint/`.
 
 ## Set up (once)
 
-**1. Connect the hand's SDK (the only code to write).**
-In `lawm_deploy/cell.py`, class `SharpaHand`, fill in three short methods from the SDK's Python samples (`/opt/sharpa-wave-sdk/python/`):
-- `__init__`: connect to the hand;
-- `read()`: return the 22 joint angles in radians;
-- `write(q)`: send 22 joint-angle targets.
-
-Use the joint order of `assets/sharpa_wave/right_hand.xml` (thumb first, then index, middle, ring, pinky), matched to the SDK by joint name.
+**1. Sharpa SDK adapter (implemented locally).**
+`SharpaHand` discovers the configured right hand, maps joints by name, converts degree feedback to radians, and sends radians. Connection is read-only; output is enabled only during an explicitly enabled move. No reset/open command is issued on startup.
 
 **2. Fill in `configs/real.yaml`.** Every line marked `CHANGE`:
 - the robot's IP address;
@@ -52,14 +88,15 @@ Use the joint order of `assets/sharpa_wave/right_hand.xml` (thumb first, then in
 - the table height.
 
 **3. Camera extrinsics** (each camera's pose in the robot base frame).
-- If you already have them, write them into `configs/calibration.yaml`: one 4×4 matrix per camera serial, for the depth optical frame.
+- If you already have them, write `configs/calibration.yaml`: declare `frame: depth_optical` and put matrices under `T_base_camera`, keyed by serial. Existing color-camera calibration must be converted with the camera-internal depth-to-color transform.
 - If not, run:
   ```bash
   python -m lawm_deploy.calibrate --config configs/real.yaml
   ```
-  It switches the arm to freedrive. Move it by hand to 5 different poses, with the hand in view of both cameras and 15 cm or more above the table, pressing Enter after each. It prints, per camera, the share of the robot's points it could match and **OK** (over 70%) or **SUSPECT**. On SUSPECT, re-measure the rough pose (it needs to be within about 3 cm and 5°) and run it again.
+  This command is read-only. Use the pendant to arrange 5 different poses, end pendant freedrive and wait until stationary before each capture, with the hand visible to both cameras and clear of the table. It prints, per camera, the share of points matched and **OK** (over 70%) or **SUSPECT**. SUSPECT results are not written; existing calibration files are not overwritten. On SUSPECT, re-measure the rough pose (it needs to be within about 3 cm and 5°) and run it again.
 
-**4. Check everything without the model.**
+**4. Check the hardware and geometry.**
+For device-only feedback (no depth calibration or LAWM required), use `./run_lawm.sh --check --devices`. The UI below still needs the LAWM library, even with a stand-in model. It does not enable motion:
 ```bash
 python -m lawm_deploy --config configs/real.yaml --standin
 ```
@@ -68,24 +105,30 @@ Open `http://localhost:8080`, then:
 - **Workspace box:** in **1. Workspace**, set the box to the table area the hand works in and press **Save box to config**. Keep it the same for every trial.
 
 ## Each trial
-Start the page with `python -m lawm_deploy --config configs/real.yaml` and open `http://localhost:8080`.
+After independently verifying mount geometry, depth calibration, workspace/table and TCP/payload, record those checks under `commissioning` in `configs/real.yaml`. Start with `python -m lawm_deploy --config configs/real.yaml --execute` and open `http://localhost:8080`. Without `--execute`, only observation and Plan only are available; controller IK is not queried.
 
 1. **Goal:** put the robot and objects where they should end up, then press **Capture goal**. In **Arrange the robot**:
-   - **Teleoperation mode:** hands the robot to your teleop system. The page keeps showing it live.
+   - **Teleoperation mode:** releases the UR controller and disconnects the Sharpa SDK. Stop teleoperation and take control back before capturing; this integration does not assume concurrent Sharpa SDK readers.
    - **Freedrive and the finger slider:** to place it by hand instead.
 2. **Start:** arrange the start the same way, then press **Capture start**. Untick **Teleoperation mode** (and stop your teleop system) before the next step.
 3. **Run:** pick the task and press **Run**. The status line shows the replan number, the distance to the goal hand, and why the robot held if it did.
 
 A run ends by itself:
-- with **success** when the hand stays within 5 cm of the goal hand for 5 replans in a row;
+- with **success** when the hand stays within 5 cm of the goal hand for 5 replans in a row (hand-goal attainment only, not proof of a successful grasp);
 - when it stalls, after 5 holds in a row, or after 80 replans;
-- or when you press **Stop**, which takes effect after the current move.
+- or when you press **Stop**. The execution loop checks this during motion and before sending a planned move; this is not a physical e-stop.
 
 **For emergencies use the pendant's e-stop.**
 
-**On the first day only:** with a start captured, press **4. Check model frame**. If another spin gives clearly more hand motion and clearly less scene motion than the one marked "now", put it in `model.spin_deg` in `configs/real.yaml` and restart.
+**Model frame:** keep `training_up=[-0.022,-0.546,-0.837]`, `spin_deg=315`, 1024 hand points and 5120 scene points fixed for this checkpoint.
 
-**Please send back** the whole `runs/` folder and a phone video of each run.
+**Please send back** the session folder, its linked hardware journal and a phone video of each run.
+
+For this local installation, logs are under `/data2/xuchuan/lawm_runs`.
+Inputs, predictions and commands are saved before execution; post-action observations,
+Plan only metrics, failure stages and Step/Run status are saved as well. Include the linked
+`hardware_*.jsonl` at the log root. Real RGB video is not recorded automatically; use a
+separate video recording. File details are in [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md).
 
 ## If something is off
 
@@ -100,16 +143,16 @@ Leave the other planner settings as they are.
 
 The robot holds instead of moving when:
 - the hand fit is poor;
-- the UR has no IK solution, or an arm joint would jump more than 30°;
-- the wrist would turn more than 30°, or a finger more than 60°;
+- the UR has no IK solution, or the arm path exceeds the configured joint excursion;
+- wrist or finger motion exceeds the configured limits;
 - the flange would leave the box;
 - the hand would go below `floor_z_m`.
 
-Each move is at most 60 mm, in a straight line, with the fingers moving smoothly over the same time.
+The local real configuration caps each move at 10 mm, wrist rotation at 8 degrees, and finger changes at 20 degrees (rotation/finger limits increased with user authorization on 2026-11-12 after reviewing live plans); simulation retains the original limits. `moveL` and minimum-jerk fingers use approximately matched timing, not a shared servo clock. Arrival, feedback and runtime limits are checked. See DEPLOYMENT_LOCAL.md for the remaining execution limitations.
 
 ## Not verified yet
-- Nothing has run on the real hardware.
-- **Teleoperation mode** assumes the Sharpa SDK can read the joint angles while your teleop system controls the hand. If it can't, say so.
+- A supervised real trial has been performed; task success and physical commissioning remain separate checks.
+- Teleoperation handover now disconnects the hand rather than assuming concurrent SDK readers. Hardware validation is pending.
 - The UR7e is modelled with the UR5e's kinematics. The overlay check in setup step 4 will show if that's wrong.
 
 ## Simulation (no hardware)
@@ -137,7 +180,7 @@ cell.views() ──> 2 depth images ──> perception.py: base-frame points, bo
                                               cost against the goal hand) ──> predicted step 1 of the hand points
                                                                                    │
 safety.py <── hand.py: fit palm pose + 22 angles to those points <─────────────────┘
-   │  executor: flange target (step ≤ 60 mm, rotation smoothed); checks: fit, IK, jumps, box, floor ──> hold if any fails
+   │  executor: flange target (configured step cap, rotation smoothed); checks: fit, IK, jumps, box, floor ──> hold if any fails
    └──> cell.move(): moveL for the arm + smooth finger targets ──> observe again
 ```
 
@@ -160,7 +203,7 @@ lawm-deployment/
 │   ├── robot_model.py           UR + Sharpa kinematics (flange, palm, surface points to mask the robot)
 │   ├── model.py                 loads the checkpoint + prior, training-frame rotation, stand-in model for tests
 │   ├── safety.py                predicted hand -> flange/finger command, and the checks that hold the robot
-│   ├── cell.py                  real hardware: UR (ur_rtde), Sharpa (SharpaHand: fill in), D435i (pyrealsense2)
+│   ├── cell.py                  real hardware: UR (ur_rtde), Sharpa (SharpaHand: implemented locally), D435i (pyrealsense2)
 │   ├── sim_cell.py              MuJoCo copy of the cell with simulated depth cameras and video recording
 │   ├── calibrate.py             camera extrinsics by matching depth points to the robot's own surface
 │   ├── config.py                reads the YAML configs

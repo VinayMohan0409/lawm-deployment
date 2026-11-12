@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 

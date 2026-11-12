@@ -1,38 +1,74 @@
 # Real cell: UR7e + Sharpa Wave (right) + 2x RealSense D435i. Every line marked CHANGE must be set before the first run.
 seed: 0
-log_dir: runs
+log_dir: /data2/xuchuan/lawm_runs # local disk on suria, avoid NFS writes in feedback loop
+
+experiment:
+  sample_pair: /data2/xuchuan/lawm_samples/grasp_20261111_171635
+  task: reach                     # owner requests reach, including for this grasp goal
 
 model:
   checkpoint: checkpoint/best.pt
   manifest: checkpoint/run_manifest.json
   prior: checkpoint/prior.npz
   training_up: [-0.022, -0.546, -0.837]   # "up" (table towards hands) in the training data's frame: mean of 200 training windows
-  spin_deg: 315                           # base-frame horizontal direction mapped to the training x axis (chosen in sim: most static scene)
+  spin_deg: 315                           # fixed checkpoint convention; owner confirmed 2026-11-11, do not retune on site
 
-mount: {xyz_m: [0.0, 0.0, 0.0], rpy_deg: [0.0, 0.0, 0.0]}   # CHANGE: hand base (MJCF origin) in the UR flange frame, from the adapter drawing
+mount: {xyz_m: [0.0, 0.0, 0.0295], rpy_deg: [0.0, 0.0, -90.0]} # nominal T_tcp_wrist from our spray69_deployment_live.json; verify on this mount
+
+# These describe completed physical checks, not permission prompts. Leave false until measured.
+commissioning:
+  mount_verified: false
+  depth_verified: false
+  workspace_verified: false
+  tcp_payload_verified: false
+  note: "2026-11-12: reused teleop TCP bounds and sample calibration/mount; floor -0.065 is a point-cloud estimate, not a physical measurement. Live overlay, floor and TCP/payload checks pending."
 
 cell:
   type: real
-  robot_ip: 192.168.1.10          # CHANGE: the UR control box
-  sharpa: {}                      # CHANGE: whatever the Sharpa SDK needs to connect (see README, "Sharpa hand")
+  robot_ip: 172.16.0.3
+  arm_hz: 125
+  expected_tcp_offset: [0, 0, 0, 0, 0, 0] # verify; never setTcp automatically
+  sharpa:
+    serial: "C2529333C253"
+    sdk_path: /opt/sharpa-wave-sdk/python
+    speed_coeff: 0.3
+    current_coeff: 0.6
+    discovery_timeout_s: 5.0
+    feedback_timeout_s: 0.15
+  guards:
+    feedback_timeout_s: 0.15
+    watchdog_timeout_s: 0.2
+    control_gap_s: 0.1
+    max_arm_speed_rad_s: 0.6
+    max_tcp_speed_m_s: 0.08
+    max_tcp_rot_speed_rad_s: 0.3
+    hand_following_error_rad: 0.35
+    arrival_position_m: 0.003
+    arrival_rotation_rad: 0.03
+    hand_arrival_rad: 0.12
+    fk_position_tolerance_m: 0.01
+    fk_rotation_tolerance_rad: 0.05
   cameras:
     width: 848
     height: 480
     fps: 30
-    n_frames: 5                   # each view = per-pixel median of this many frames
-    preset: 3                     # RealSense visual preset (3 = High Accuracy); null = leave as is
+    n_frames: 1                   # match the approved static start/goal's single native frame
+    preset: 0                     # sample recorded Custom (0); do not switch to High Accuracy
+    sensor_options: {enable_auto_exposure: 1.0, laser_power: 150.0} # observed in both sample cameras; exposure/gain remain automatic
+    emitter: "on"                 # model owner requests emitter ON for real observations/runs; 2026-11-11
+    timeout_ms: 2000
     calibration: configs/calibration.yaml   # written by python -m lawm_deploy.calibrate
-    devices:                      # CHANGE: serials, in quotes (see README), and a tape-measured pose: eye = camera position, target = a point it looks at (m, robot base frame)
-      - {serial: "CHANGE", rough_eye: [0.95, -0.45, 0.60], rough_target: [0.5, 0.15, 0.05]}
-      - {serial: "CHANGE", rough_eye: [0.95, 0.75, 0.60], rough_target: [0.5, 0.15, 0.05]}
-  motion: {speed: 0.05, accel: 0.25, rot_speed: 0.3, finger_speed: 0.5, min_move_s: 0.5, finger_rate_hz: 100, settle_s: 0.3}   # start slow; raise once moves look right
+    devices:                      # calibrated operation uses calibration.yaml; rough poses are only ICP initial guesses
+      - {serial: "243222072419", rough_eye: [0.95, -0.45, 0.60], rough_target: [0.5, 0.15, 0.05]}
+      - {serial: "243522075081", rough_eye: [0.95, 0.75, 0.60], rough_target: [0.5, 0.15, 0.05]}
+  motion: {speed: 0.02, accel: 0.1, rot_speed: 0.15, finger_speed: 0.3, finger_accel: 1.0, min_move_s: 0.5, finger_rate_hz: 100, settle_s: 0.3}
 
 perception:
   near_m: 0.2
   far_m: 2.0
   use_box: true                    # crop to the workspace box (false: everything the cameras see within near..far)
-  box_lo: [0.15, -0.35, -0.05]     # CHANGE (in the UI): workspace box (m, base frame), fixed before any trial
-  box_hi: [0.85, 0.65, 0.45]
+  box_lo: [-0.05, -0.9, -0.15]    # saved sample preview bounds, includes cup/table; perception only
+  box_hi: [0.9, 0.15, 0.55]       # keep fixed across this pair's trials
   robot_margin_m: 0.015            # camera points this close to the arm/hand surface (FK) are dropped
   voxel_m: 0.015                   # one camera point per 1.5 cm voxel (PointWorld's grid)
   n_hand: 1024                     # Sharpa mesh points
@@ -40,15 +76,15 @@ perception:
   min_scene_points: 500
 
 safety:
-  max_step_mm: 60.0                # lawm's DexWM value
+  max_step_mm: 10.0                # conservative first real-test cap; sim keeps original 60 mm
   ori_alpha: 0.5                   # lawm's DexWM value
-  max_rot_deg: 30.0                # hold if one replan would turn the wrist more than this
-  max_finger_deg: 60.0             # hold if one replan would move a finger joint more than this
-  max_joint_deg: 30.0              # hold if the UR's IK solution jumps an arm joint more than this (wrist flips)
+  max_rot_deg: 8.0                 # user authorized wider trial bounds 2026-11-12; observed plans ~5.7 deg
+  max_finger_deg: 20.0             # user authorized; observed max ~15.2 deg; absolute joint limits unchanged
+  max_joint_deg: 10.0
   max_fit_residual_mm: 15.0        # hold if the hand fit is worse than this
-  box_lo: [0.15, -0.4, 0.05]       # CHANGE: the flange may only be commanded inside this box (m, base frame)
-  box_hi: [0.9, 0.7, 0.7]
-  floor_z_m: 0.0                   # CHANGE: no commanded hand point below this height (m, base frame): the table height plus a few mm
+  box_lo: [-1.2, -1.2, -0.012950372713809666] # existing vive_right_dual_base_calibrated + spray1111 TCP bounds; zero TCP
+  box_hi: [1.2, 1.2, 1.5]         # operating envelope, not an obstacle/collision model
+  floor_z_m: -0.065                # estimated table near -0.075 + 10 mm; physical confirmation pending
 
 # Planner: lawm's configs/stage3/dexwm.json, unchanged (reach and grasp; place needs object labels).
 planner:

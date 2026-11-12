@@ -1,6 +1,7 @@
 """The whole pipeline in the simulated cell: perception, smooth moves, and a reach run with the stand-in model."""
 import numpy as np
 import pytest
+import json
 from lawm_deploy.model import StandInModel
 from scipy.spatial import cKDTree
 
@@ -117,11 +118,53 @@ def test_each_run_is_new_and_plan_only_changes_nothing(cell, tmp_path):
     first_dir = s.run_dir
     s.step(execute=False)
     assert s.replan == 0 and s.records == [] and not list(first_dir.glob("replan_*.npz"))
+    plans = [json.loads(line) for line in (first_dir / 'plans.jsonl').read_text().splitlines()]
+    assert len(plans) == 1 and plans[0]['plan_only'] and not plans[0]['moved']
+    assert (first_dir / 'input_plan_only_000.npz').exists()
+    assert (first_dir / 'prediction_plan_only_000.npz').exists()
+    assert json.loads((first_dir / 'status.json').read_text())['reason'] == 'plan only complete'
     s.step()
-    import time
-    time.sleep(1.1)  # run folders are named by the second
+    assert (first_dir / 'after_replan_000.npz').exists()
+    with np.load(first_dir / 'replan_000.npz') as saved:
+        assert saved['q_arm_ik'].shape == (6,)
+    assert json.loads((first_dir / 'status.json').read_text())['replans'] == 1
     s.begin("reach")
     assert s.run_dir != first_dir and s.replan == 0 and s.records == [] and not s.finished
+
+
+@pytest.mark.parametrize('stage', ['plan', 'fit', 'ik_and_checks', 'move', 'observe_after'])
+def test_failed_step_retains_inputs_prediction_and_error_stage(cell, tmp_path, monkeypatch, stage):
+    s, _ = started(cell, tmp_path)
+    s.begin('reach')
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected failure at ' + stage)
+    if stage == 'plan': monkeypatch.setattr(s.planner, 'plan', fail)
+    elif stage == 'fit': monkeypatch.setattr(s.hand, 'fit', fail)
+    elif stage == 'ik_and_checks': monkeypatch.setattr(s.cell, 'ik', fail)
+    elif stage == 'move': monkeypatch.setattr(s.cell, 'move', fail)
+    else: monkeypatch.setattr(s, 'observe', fail)  # simulation reuses stationary pre-observation
+    with pytest.raises(RuntimeError, match='injected failure'):
+        s.step()
+    assert (s.run_dir / 'input_replan_000.npz').exists()
+    assert (s.run_dir / 'prediction_replan_000.npz').exists() == (stage != 'plan')
+    if stage in ('move', 'observe_after'):
+        assert (s.run_dir / 'replan_000.npz').exists()
+    status = json.loads((s.run_dir / 'status.json').read_text())
+    assert status['loop_ended'] and status['reason'] == 'error' and status['physical_grasp_success'] is None
+    events = [json.loads(line) for line in (s.run_dir / 'events.jsonl').read_text().splitlines()]
+    assert events[-1]['event'] == 'step_failed' and events[-1]['stage'] == stage
+
+
+def test_single_step_success_finalizes_without_run(cell, tmp_path):
+    s = Session(cell, CFG, StandInModel(), tmp_path)
+    s.capture_goal()
+    s.capture_start()
+    s.cfg = dict(s.cfg, loop=dict(s.cfg['loop'], reach=dict(s.cfg['loop']['reach'], success_replans=1)))
+    s.begin('reach')
+    assert s.step()['stop'] == 'success'
+    status = json.loads((s.run_dir / 'status.json').read_text())
+    assert status['loop_ended'] and status['hand_goal_reached'] and status['replans'] == 1
+    assert (s.run_dir / 'after_replan_000.npz').exists()
 
 
 def test_stop_halts_a_move(cell):
