@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import copy
 import time
 from dataclasses import dataclass
@@ -11,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from lawm_deploy.hardware_contract import HardwareError
+from lawm_deploy.hardware_contract import HardwareError, StepTranslationRejected
 from lawm_deploy.model_contract import timing_metadata, validate_model_contract
 from lawm_deploy.observation_io import save_observation
 
@@ -22,11 +21,11 @@ from lawm.sim.dexwm.planning.phase_gates import GateSettings, HoverSettings
 from lawm.sim.dexwm.planning.plan_costs import CostWeights
 from lawm.sim.dexwm.planning.task_planner import TaskPlanner
 
-from lawm_deploy.config import mount_pose
+from lawm_deploy.config import mount_pose, execution_steps
 from lawm_deploy.hand import Hand
 from lawm_deploy.perception import Perception, PerceptionSettings
 from lawm_deploy.robot_model import RobotModel, ARM_JOINTS
-from lawm_deploy.safety import Executor, SafetySettings, check
+from lawm_deploy.safety import Executor, SafetySettings, check, limit_finger_step
 
 TASKS = ("reach", "grasp")  # place needs object labels, which real camera clouds do not have
 
@@ -75,22 +74,23 @@ def planner_settings(cfg, task):
 class Session:
     """Goal, start and the replan loop of one experiment on one cell (real or simulated) with one model."""
 
-    def __init__(self, cell, cfg, model, log_root):
+    def __init__(self, cell, cfg, model, log_root, *, capture_only=False):
         """Build the robot model, the hand cloud and perception; captures go to log_root/<time>, each run to its own folder inside it."""
         self.cell, self.cfg, self.model = cell, cfg, model
+        self.execute_steps = execution_steps(cfg)
+        self.pending_plan, self.planning_calls = None, 0
         validate_model_contract(cfg)
-        from lawm_deploy.config import repo_path
-        self.provenance = dict(checkpoint_sha256=hashlib.sha256(repo_path(cfg["model"]["checkpoint"]).read_bytes()).hexdigest(),
-                               simulation_validation="shared checkpoint not the exact simulation-tested checkpoint, per owner 2026-11-11",
-                               camera_observation_validation="pending", **timing_metadata())
+        self.provenance = dict(checkpoint_sha256=getattr(model, 'checkpoint_sha256', None),
+                               model_type=type(model).__name__ if model is not None else None,
+                               **timing_metadata())
         self.robot = RobotModel(mount_pose(cfg), seed=cfg["seed"])
         self.hand = Hand(self.robot.model, cfg["perception"]["n_hand"], cfg["seed"])
         self.perception = Perception(PerceptionSettings(**cfg["perception"]), cfg["seed"])
         self.safety = SafetySettings(**cfg["safety"])
         if hasattr(cell, "validate_hand_path"):
             cell.validate_hand_path = self.check_hand_path
-        self.log = Path(log_root) / f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
-        self.log.mkdir(parents=True, exist_ok=True)
+        self.log = Path(log_root) if capture_only else Path(log_root) / f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+        self.log.mkdir(parents=True, exist_ok=not capture_only)
         self.goal = self.start = self.current = self.planner = self.last_plan = self.run_dir = None
         self.task, self.replan, self.holds, self.records, self.finished = None, 0, 0, [], True
 
@@ -191,6 +191,7 @@ class Session:
         self.loop = LoopSettings(**self.cfg["loop"][task])
         self.stall = None if self.loop.stall_patience is None else StallDetector(self.loop.stall_patience, self.loop.stall_tol_mm)
         self.task, self.replan, self.holds, self.within, self.records, self.finished, self.plan_only_count = task, 0, 0, 0, [], False, 0
+        self.pending_plan, self.planning_calls = None, 0
         self.run_dir = self.log / f"{time.strftime('%H%M%S')}_{task}_{time.time_ns()}"
         self.run_dir.mkdir()
         (self.run_dir / "run.json").write_text(json.dumps(dict(task=task, seed=seed, config=self.cfg,
@@ -214,14 +215,15 @@ class Session:
         if self.run_dir is not None:
             temporary = self.run_dir / 'status.json.tmp'
             temporary.write_text(json.dumps(dict(loop_ended=loop_ended, reason=reason, error=error,
-                replans=self.replan, hand_goal_reached=reason == 'success', physical_grasp_success=None,
+                replans=self.replan, step_attempts=self.replan, planning_calls=self.planning_calls,
+                hand_goal_reached=reason == 'success', physical_grasp_success=None,
                 updated_unix_ns=time.time_ns()), indent=2) + '\n')
             temporary.replace(self.run_dir / 'status.json')
 
-    def step(self, execute=True):
+    def step(self, execute=True, *, reuse_plan=False):
         """One logged attempt. Plan only keeps execution counters/gates unchanged."""
         try:
-            record = self._step(execute)
+            record = self._step(execute, reuse_plan=reuse_plan)
             self.write_status(record['stop'] or ('step complete' if execute else 'plan only complete'),
                               loop_ended=self.finished)
             if self.finished:
@@ -238,9 +240,11 @@ class Session:
                 pass
             raise
 
-    def _step(self, execute=True):
+    def _step(self, execute=True, *, reuse_plan=False):
         if execute and getattr(self.cell, "read_only", False):
             raise HardwareError("Read-only session cannot execute")
+        if not (execute and reuse_plan):
+            self.pending_plan = None  # Plan only and manual Step always plan afresh.
         stem = f'replan_{self.replan:03d}' if execute else f'plan_only_{self.plan_only_count:03d}'
         self._stage = 'observe'
         self.event('step_started', replan=self.replan, execute=execute, archive_stem=stem)
@@ -248,20 +252,50 @@ class Session:
         self.save(f'input_{stem}', obs, self.run_dir)
         self._stage = 'plan'
         started = time.monotonic()
-        hand_target, plan = self.planner.plan(obs.coords, self.replan)
-        planning_elapsed_s = time.monotonic() - started
+        reused = self.pending_plan is not None
+        if not reused:
+            hand_target, plan = self.planner.plan(obs.coords, self.replan)
+            planning_elapsed_s = time.monotonic() - started
+            self.planning_calls += 1
+            count = self.execute_steps if execute and reuse_plan else 1
+            if plan.executed == 'hold':
+                count = 1
+            delta = np.asarray(plan.delta)
+            if delta.ndim != 3 or delta.shape[1:] != obs.coords.shape or len(delta) < count:
+                raise HardwareError('Predicted trajectory shape/horizon does not match execute_steps')
+            # delta[k] is cumulative from THIS planning observation, not from
+            # the preceding step. Later goals must not be added to live points.
+            targets = obs.coords[obs.segment == SEG_HAND][None] + delta[:count, obs.segment == SEG_HAND]
+            self.pending_plan = dict(plan=plan, targets=targets.copy(), index=0,
+                                     source_replan=self.replan, planning_call=self.planning_calls,
+                                     source_input=f'input_{stem}.npz')
+        else:
+            planning_elapsed_s = 0.0
+        cached = self.pending_plan
+        plan, index = cached['plan'], cached['index']
+        hand_target = cached['targets'][index]
+        metadata = dict(planning_call=cached['planning_call'], plan_source_replan=cached['source_replan'],
+                        predicted_step=index + 1, execute_steps=len(cached['targets']), reused_plan=reused,
+                        delta_reference_archive=cached['source_input'])
         # Save before fitting/IK/motion: a failed step must retain its prediction.
         np.savez_compressed(self.run_dir / f'prediction_{stem}.npz', delta=plan.delta,
-                            hand_target=hand_target, planning_elapsed_s=planning_elapsed_s)
+                            hand_target=hand_target, planning_elapsed_s=planning_elapsed_s,
+                            plan_metadata_json=json.dumps(metadata))
         if not np.isfinite(hand_target).all():
             raise HardwareError("Model predicted nonfinite hand points")
         self._stage = 'fit'
         rot, pos, q, fit = self.hand.fit(hand_target, obs.q_hand)
         target, fingers, move_mm = self.executor.command(rot, pos, q, obs.root, obs.flange)
+        requested_fingers = fingers.copy()
+        margin = self.cfg['cell'].get('guards', {}).get('hand_feedback_limit_tolerance_deg', 0.0)
+        fingers, finger_limits = limit_finger_step(fingers, obs.q_hand, self.robot.hand_limits,
+                                                  self.safety.max_finger_deg, margin)
+        metadata.update(finger_limits)
         commanded_mm = float(np.linalg.norm(target[:3, 3] - obs.flange[:3, 3]) * 1000)
         np.savez_compressed(self.run_dir / f'command_{stem}.npz', target=target, fingers=fingers,
+                            requested_fingers=requested_fingers,
                             fitted_root_rotation=rot, fitted_root_position=pos, fitted_fingers=q,
-                            fit_json=json.dumps(fit))
+                            fit_json=json.dumps(fit), plan_metadata_json=json.dumps(metadata))
         self._stage = 'ik_and_checks'
         q_ik = self.cell.ik(target, obs.q_arm)
         commanded_hand = self.hand.points(target @ self.robot.root_in_flange, fingers)
@@ -270,23 +304,26 @@ class Session:
             hold = "controller IK not checked in read-only mode" if hold == "no arm IK solution for the target" else hold
         self.last_plan = dict(hand_target=hand_target, commanded_hand=commanded_hand)
         self.save(stem, obs, self.run_dir, delta=plan.delta, target=target, fingers=fingers,
+                  requested_fingers=requested_fingers,
                   hand_target=hand_target, q_arm_ik=np.asarray(q_ik) if q_ik is not None else np.empty(0),
                   ik_query_performed=not getattr(self.cell, 'read_only', False),
-                  fit_json=json.dumps(fit), hold_json=json.dumps(hold))
+                  fit_json=json.dumps(fit), hold_json=json.dumps(hold), plan_metadata_json=json.dumps(metadata))
         self.event('plan_ready', replan=self.replan, execute=execute, hold=hold,
                    planning_elapsed_s=planning_elapsed_s, commanded_mm=commanded_mm,
-                   unclipped_command_mm=move_mm)
+                   unclipped_command_mm=move_mm, **metadata)
         if not execute:
             self.plan_only_count += 1
             record = dict(replan=self.replan, distance_mm=task_distance_mm(obs, self.goal), moved=False, hold=hold, executed=plan.executed, plan_cost=plan.cost,
                         predicted_error_mm=plan.final_hand_error_mm, commanded_mm=commanded_mm,
                         unclipped_command_mm=move_mm, planning_elapsed_s=planning_elapsed_s,
                         fit_residual_mm=fit["mean_residual_mm"], phase_changed=False,
-                        within_success=self.within, stop=None, plan_only=True)
+                        within_success=self.within, stop=None, plan_only=True, **metadata)
+            self.pending_plan = None
             with (self.run_dir / 'plans.jsonl').open('a') as f:
                 f.write(json.dumps(dict(record, archive_stem=stem)) + '\n')
             return record
         moved = hold is None
+        motion_result = None
         if moved:
             self._stage = 'move'
             if self.cell.stop_requested.is_set():
@@ -294,8 +331,14 @@ class Session:
             current_arm, current_hand, _ = self.cell.state()
             if np.max(np.abs(current_arm-obs.q_arm)) > 0.01 or np.max(np.abs(current_hand-obs.q_hand)) > 0.03:
                 raise HardwareError("Robot moved during planning; discard target")
-            self.cell.move(target, fingers)
-            self.executor.sent(target)
+            try:
+                motion_result = self.cell.move(target, fingers)
+            except StepTranslationRejected as exc:
+                moved, hold = False, str(exc)
+                self.event('execution_hold', replan=self.replan, hold=hold, motion_sent=False)
+            else:
+                self.executor.sent(target)
+        partial_motion = motion_result is not None and not motion_result['hand_target_reached']
         self.holds = 0 if hold is None else self.holds + 1
         self._stage = 'observe_after'
         new = self.observe() if moved else obs
@@ -307,17 +350,24 @@ class Session:
                       predicted_error_mm=plan.final_hand_error_mm, commanded_mm=commanded_mm,
                       unclipped_command_mm=move_mm, planning_elapsed_s=planning_elapsed_s,
                       fit_residual_mm=fit["mean_residual_mm"], phase_changed=phase,
-                      elapsed_s=time.monotonic()-started, success_definition="hand_mean_point_distance_only; not grasp success")
+                      elapsed_s=time.monotonic()-started, motion_result=motion_result,
+                      partial_motion=partial_motion,
+                      success_definition="hand_mean_point_distance_only; not grasp success", **metadata)
         self.current, self.replan = new, self.replan + 1
         self.within = self.within + 1 if dist < self.loop.success_mm else 0
         record["within_success"] = self.within
         record["stop"] = ("success" if self.within >= self.loop.success_replans else "too many holds" if self.holds >= self.loop.max_holds
                           else "stalled" if moved and self.stall and self.stall.update(dist) else "max replans" if self.replan >= self.loop.max_replans else None)
         self.finished = record["stop"] is not None
+        if moved and not partial_motion and not finger_limits['finger_step_limited'] and not phase and not self.finished and index + 1 < len(cached['targets']):
+            cached['index'] += 1
+        else:
+            self.pending_plan = None  # Limited/partial moves invalidate predictions assuming the full target.
         self.records.append(record)
         with open(self.run_dir / "records.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
-        self.event('step_completed', replan=self.replan - 1, moved=moved, hold=hold, stop=record['stop'])
+        self.event('step_completed', replan=self.replan - 1, moved=moved, hold=hold,
+                   partial_motion=partial_motion, motion_result=motion_result, stop=record['stop'])
         return record
 
     def run(self, execute=True, should_stop=lambda: False, on_step=lambda record: None):
@@ -328,7 +378,7 @@ class Session:
         error = None
         try:
             while not should_stop():
-                record = self.step(execute)
+                record = self.step(execute, reuse_plan=True)
                 on_step(record)
                 if record["stop"]:
                     reason = record["stop"]
@@ -344,6 +394,7 @@ class Session:
     def finish(self, reason=None, error=None):
         """Finalize Step/Run/Stop consistently, including the simulated video."""
         self.finished = True
+        self.pending_plan = None
         if reason is None and self.records:
             reason = self.records[-1].get('stop')
         self.write_status(reason or 'closed', error=error, loop_ended=True)

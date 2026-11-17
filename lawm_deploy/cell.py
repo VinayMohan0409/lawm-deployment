@@ -17,7 +17,7 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation, Slerp
 
-from lawm_deploy.hardware_contract import HardwareError, hand_contract, transform, vector, validate_cell_settings
+from lawm_deploy.hardware_contract import HardwareError, StepTranslationRejected, hand_contract, transform, vector, validate_cell_settings
 from lawm_deploy.robot_model import pose
 
 
@@ -93,9 +93,12 @@ class SharpaHand:
         self.manager = self.wave = None
         self.enabled = False
         self.last_receipt = None
-        sdk = settings.get("sdk_path", "/opt/sharpa-wave-sdk/python")
-        if sdk not in sys.path:
-            sys.path.insert(0, sdk)
+        sdk = settings.get("sdk_path") or os.environ.get('SHARPA_SDK_PYTHON')
+        if sdk:
+            from lawm_deploy.config import repo_path
+            sdk = str(repo_path(sdk))
+            if sdk not in sys.path:
+                sys.path.insert(0, sdk)
         from sharpa import SharpaWaveManager, DeviceType, HandSide
         try:
             self.manager = SharpaWaveManager.get_instance()
@@ -293,6 +296,8 @@ class RealCell:
         self.cfg, self.full_config = cfg, full_config
         self.motion = MotionSettings(**cfg["motion"])
         self.ip, self.joint_names = cfg["robot_ip"], hand_joint_names
+        names, bounds = hand_contract()
+        self.hand_bounds = bounds[[names.index(n) for n in hand_joint_names]]
         self.read_only, self.teach, self._released = not execute, False, False
         self.ctrl = self.recv = self.hand = self.cameras = None
         self.stop_requested = threading.Event()
@@ -304,7 +309,7 @@ class RealCell:
             from lawm_deploy.hardware_contract import require_execution_setup
             if full_config is None:
                 raise HardwareError("Execution requires the complete site configuration")
-            require_execution_setup(full_config, trial_step=trial_step or trial_run)
+            require_execution_setup(full_config)
         if full_config is not None:
             from lawm_deploy.config import repo_path
             log_dir = repo_path(full_config["log_dir"])
@@ -325,8 +330,7 @@ class RealCell:
             self.event("connected", read_only=self.read_only, robot_ip=self.ip,
                        camera_metadata=self.cameras.metadata if self.cameras else [],
                        execution_mode='supervised_trial_step' if trial_step else ('supervised_trial_run' if trial_run else ('execute' if execute else 'read_only')),
-                       commissioning=full_config.get('commissioning', {}) if full_config else {},
-                       existing_setup_accepted_for_trial=trial_step or trial_run, max_move_attempts=1 if trial_step else None)
+                       max_move_attempts=1 if trial_step else None)
         except BaseException:
             self.close()
             raise
@@ -370,7 +374,7 @@ class RealCell:
 
     def take_control(self):
         if self.read_only:
-            raise HardwareError("Read-only mode: restart with --execute after commissioning")
+            raise HardwareError("Read-only mode: restart with --execute to enable motion")
         if self.hand is None:
             self.hand = SharpaHand(self.cfg["sharpa"], self.joint_names)
         self._released = False
@@ -441,21 +445,40 @@ class RealCell:
         result = vector(ctrl.getInverseKinematics(x, q), 6, "IK result")
         return result if ctrl.isJointsWithinSafetyLimits(result.tolist()) else None
 
+    def _check_hand_feedback(self, measured):
+        """Keep raw feedback; allow only a small configured overrun of model bounds."""
+        measured = vector(measured, 22, 'measured hand')
+        bounded = np.clip(measured, self.hand_bounds[:, 0], self.hand_bounds[:, 1])
+        excess = np.abs(measured - bounded)
+        i = int(np.argmax(excess))
+        tolerance = self.guards.get('hand_feedback_limit_tolerance_deg', 0.0)
+        if np.degrees(excess[i]) > tolerance + 1e-9:
+            raise HardwareError(
+                f'Measured hand outside joint limits beyond feedback tolerance: {self.joint_names[i]} '
+                f'{np.degrees(measured[i]):.3f} deg; bounds '
+                f'[{np.degrees(self.hand_bounds[i, 0]):.3f}, {np.degrees(self.hand_bounds[i, 1]):.3f}] deg; '
+                f'excess {np.degrees(excess[i]):.3f} deg > {tolerance:.3f} deg')
+        return bounded
+
     def _check_target(self, target, fingers, q0, h0, flange):
         s = self.full_config["safety"]
-        _, bounds = hand_contract()
+        bounds = self.hand_bounds
         # Hand command bounds are also checked again by the SDK adapter.
         if np.any(fingers < bounds[:, 0]) or np.any(fingers > bounds[:, 1]):
             raise HardwareError("Hand target outside joint limits")
-        if np.any(h0 < bounds[:, 0]) or np.any(h0 > bounds[:, 1]):
-            raise HardwareError("Measured hand starts outside joint limits; no arm motion sent")
+        command_start = self._check_hand_feedback(h0)
         if not ((target[:3, 3] >= s["box_lo"]).all() and (target[:3, 3] <= s["box_hi"]).all()
                 and (flange[:3, 3] >= s["box_lo"]).all() and (flange[:3, 3] <= s["box_hi"]).all()):
-            raise HardwareError("Measured/target flange outside commissioned workspace")
-        if np.linalg.norm(target[:3, 3] - flange[:3, 3]) * 1000 > s["max_step_mm"] + 1e-6:
-            raise HardwareError("Flange translation exceeds step limit")
+            raise HardwareError("Measured/target flange outside configured workspace")
+        distance_mm = float(np.linalg.norm(target[:3, 3] - flange[:3, 3]) * 1000)
+        limit_mm = s["max_step_mm"] + s.get("execution_step_margin_mm", 0.0)
+        if distance_mm > limit_mm + 1e-6:
+            self.event("translation_rejected", distance_mm=distance_mm, limit_mm=limit_mm,
+                       measured_flange=flange.tolist(), target=target.tolist())
+            raise StepTranslationRejected(
+                f"Flange translation exceeds step limit: {distance_mm:.3f} mm > {limit_mm:.3f} mm")
         angle = Rotation.from_matrix(target[:3, :3] @ flange[:3, :3].T).magnitude()
-        if np.degrees(angle) > s["max_rot_deg"] or np.degrees(np.abs(fingers - h0).max()) > s["max_finger_deg"]:
+        if np.degrees(angle) > s["max_rot_deg"] or np.degrees(np.abs(fingers - h0).max()) > s["max_finger_deg"] + 1e-6:
             raise HardwareError("Wrist/finger step exceeds limit")
         rotations = Slerp([0, 1], Rotation.from_matrix(np.stack([flange[:3, :3], target[:3, :3]])))
         last = q0
@@ -470,9 +493,16 @@ class RealCell:
         if self.validate_hand_path is None:
             raise HardwareError("Hand path geometry validator is not installed")
         self.validate_hand_path(flange, target, h0, fingers)
+        if not np.array_equal(command_start, h0):
+            self.validate_hand_path(flange, target, command_start, fingers)
         return angle
 
     def move(self, target, q_hand):
+        """Execute one bounded motion; return measured arrival or partial hand tracking.
+
+        A partial result requires the arm to have arrived and all runtime checks
+        to pass. The caller must observe again and discard cached predictions.
+        """
         if self.trial_step and self.trial_attempted:
             raise HardwareError('Trial step already attempted; restart only after reviewing its result')
         if self.read_only or self._released or self.teach:
@@ -486,11 +516,18 @@ class RealCell:
             angle = self._check_target(target, fingers, q0, h0, flange)
             # Re-read after controller path queries; do not execute a stale start.
             q1, h1, _ = self.state()
+            self._check_hand_feedback(h1)
             if np.max(np.abs(q1-q0)) > 0.01 or np.max(np.abs(h1-h0)) > 0.03:
                 raise HardwareError("Robot moved during path validation")
             if self.stop_requested.is_set():
                 raise HardwareError("Stop requested during path validation")
             duration = move_duration(self.motion, flange, target, h0, fingers)
+            command_start = np.clip(h0, self.hand_bounds[:, 0], self.hand_bounds[:, 1])
+            if not np.array_equal(command_start, h0):
+                self.event('hand_feedback_tolerated', measured_hand=h0.tolist(),
+                           command_start=command_start.tolist(),
+                           excess_deg=np.degrees(np.abs(h0-command_start)).tolist(),
+                           tolerance_deg=self.guards.get('hand_feedback_limit_tolerance_deg', 0.0))
             dist = np.linalg.norm(target[:3, 3] - flange[:3, 3])
             # moveL interprets speed as tool translation, or rotation for a pure rotation.
             # This slows the arm to approximately match the finger duration; arrival is measured.
@@ -498,7 +535,8 @@ class RealCell:
             speed = min(self.motion.speed if dist > 1e-6 else self.motion.rot_speed,
                         max(length / duration, 1e-5))
             self.event("move_start", target=target.tolist(), hand_target=fingers.tolist(),
-                       hand_start=h0.tolist(), arm_start=q0.tolist(), duration_s=duration, moveL_speed=speed,
+                       hand_start=h0.tolist(), hand_command_start=command_start.tolist(),
+                       arm_start=q0.tolist(), duration_s=duration, moveL_speed=speed,
                        timing_contract="asynchronous moveL plus timed fingers; approximate synchronization")
             if self.trial_step:
                 self.trial_attempted = True  # consume even if sending fails; never retry a partly sent move
@@ -510,18 +548,28 @@ class RealCell:
             if length > 1e-7 and not ctrl.moveL(vec_from_pose(target), speed, self.motion.accel, True):
                 raise HardwareError("UR moveL rejected command")
             start = previous = time.monotonic()
-            deadline = start + max(5.0, 3 * duration + 2)
-            last_hand = h0
+            arm_deadline = start + max(5.0, 3 * duration + 2)
+            last_hand = command_start
+            last_arrival = None
+            hand_settle_start = None
+            hand_target_reached = False
+            max_gap = 0.0
+            period = 1.0 / self.motion.finger_rate_hz
             next_log = start
             while True:
                 now = time.monotonic()
+                gap = now - previous
+                max_gap = max(max_gap, gap)
                 if self.stop_requested.is_set():
                     raise HardwareError("Motion stopped by user")
-                if now > deadline or now - previous > self.guards["control_gap_s"]:
-                    raise HardwareError("Motion timeout or control loop stalled")
+                if gap > self.guards["control_gap_s"]:
+                    self.event('control_loop_stalled', loop_gap_s=gap,
+                               limit_s=self.guards['control_gap_s'], elapsed_s=now-start)
+                    raise HardwareError(f"Control loop stalled: gap {gap:.3f} s > {self.guards['control_gap_s']:.3f} s")
                 if not ctrl.kickWatchdog():
                     raise HardwareError("UR watchdog kick failed")
                 qa, measured_hand, actual = self.state()
+                self._check_hand_feedback(measured_hand)
                 if np.max(np.abs(qa-q0)) > np.radians(self.full_config["safety"]["max_joint_deg"]):
                     raise HardwareError("Measured arm excursion exceeds limit")
                 s = self.full_config["safety"]
@@ -531,7 +579,8 @@ class RealCell:
                 if np.max(np.abs(last_hand - measured_hand)) > self.guards["hand_following_error_rad"]:
                     raise HardwareError("Sharpa following error")
                 fraction = min_jerk((now-start) / duration)
-                command = h0 + (fingers-h0) * fraction
+                command = np.clip(command_start + (fingers-command_start) * fraction,
+                                  self.hand_bounds[:, 0], self.hand_bounds[:, 1])
                 self.hand.write(command)
                 last_hand = command
                 if now >= next_log:
@@ -541,19 +590,80 @@ class RealCell:
                 moving = length > 1e-7 and ctrl.getAsyncOperationProgress() >= 0
                 pos_error = np.linalg.norm(actual[:3, 3]-target[:3, 3])
                 rot_error = Rotation.from_matrix(actual[:3,:3] @ target[:3,:3].T).magnitude()
-                arrived = (pos_error <= self.guards["arrival_position_m"]
-                           and rot_error <= self.guards["arrival_rotation_rad"]
-                           and np.max(np.abs(measured_hand-fingers)) <= self.guards["hand_arrival_rad"])
-                if now-start >= duration and not moving and arrived:
-                    break
+                hand_errors = np.abs(measured_hand-fingers)
+                worst = int(np.argmax(hand_errors))
+                last_arrival = dict(monotonic=now, arm_position_error_mm=float(pos_error*1000),
+                    arm_rotation_error_deg=float(np.degrees(rot_error)), arm_moving=bool(moving),
+                    worst_hand_joint=self.joint_names[worst],
+                    hand_actual_deg=float(np.degrees(measured_hand[worst])),
+                    hand_target_deg=float(np.degrees(fingers[worst])),
+                    hand_error_deg=float(np.degrees(hand_errors[worst])),
+                    hand_tolerance_deg=float(np.degrees(self.guards['hand_arrival_rad'])))
+                arm_arrived = (not moving and pos_error <= self.guards["arrival_position_m"]
+                               and rot_error <= self.guards["arrival_rotation_rad"])
+                # moveL may take longer than nominal finger interpolation. Its
+                # deadline must never cut short the separate hand settling phase.
+                # Decide from THIS cycle's validated feedback, not last_arrival
+                # from a prior cycle just before the deadline.
+                if now > arm_deadline and not arm_arrived:
+                    self.event('motion_timeout', timeout_phase='arm', elapsed_s=now-start,
+                               timeout_s=arm_deadline-start, loop_gap_s=gap,
+                               max_control_gap_s=max_gap,
+                               last_arrival=last_arrival)
+                    detail = (
+                        f"arm position error {last_arrival['arm_position_error_mm']:.2f} mm; "
+                        f"rotation error {last_arrival['arm_rotation_error_deg']:.2f} deg; "
+                        f"arm moving {last_arrival['arm_moving']}; "
+                        f"{last_arrival['worst_hand_joint']} actual {last_arrival['hand_actual_deg']:.2f} deg, "
+                        f"target {last_arrival['hand_target_deg']:.2f} deg, "
+                        f"error {last_arrival['hand_error_deg']:.2f} deg "
+                        f"(arrival tolerance {last_arrival['hand_tolerance_deg']:.2f} deg)")
+                    raise HardwareError(f'Motion arrival timeout after {now-start:.2f} s: {detail}')
+                hand_target_reached = bool(np.max(hand_errors) <= self.guards['hand_arrival_rad'])
+                if now-start >= duration and arm_arrived:
+                    if hand_target_reached:
+                        break
+                    if hand_settle_start is None:
+                        hand_settle_start = now
+                        self.event('hand_settle_started', elapsed_s=now-start,
+                                   nominal_duration_s=duration, arm_timeout_s=arm_deadline-start,
+                                   hand_settle_timeout_s=self.guards.get('hand_settle_timeout_s', 1.0),
+                                   arrival=last_arrival)
+                    if now-hand_settle_start >= self.guards.get('hand_settle_timeout_s', 1.0):
+                        # End pursuit of an unachieved target before slow inference.
+                        # Feedback remains raw in the result; only the hold command
+                        # is clipped for tolerated encoder overruns at joint bounds.
+                        hold_command = np.clip(measured_hand, self.hand_bounds[:, 0], self.hand_bounds[:, 1])
+                        self.hand.write(hold_command)
+                        break
+                else:
+                    hand_settle_start = None
+                work_done = time.monotonic()
+                sleep_s = max(0., now + period - work_done)
                 previous = now
-                time.sleep(1.0 / self.motion.finger_rate_hz)
+                # Processing consumes part of the period. Do not add a full
+                # period after work, or issue bursts to catch up after a delay.
+                time.sleep(sleep_s)
             # Stop the control script at each action boundary: no idle watchdog thread,
             # no lingering move command while model inference or camera reads block.
             self._release_arm()
-            self.event("move_arrived", elapsed_s=time.monotonic()-start)
+            result = dict(outcome='arrived' if hand_target_reached else 'hand_target_not_reached',
+                          hand_target_reached=hand_target_reached, arrival=last_arrival,
+                          hand_settle_elapsed_s=0.0 if hand_settle_start is None else now-hand_settle_start,
+                          joint_names=list(self.joint_names), hand_actual=measured_hand.tolist(),
+                          hand_target=fingers.tolist(), hand_error_deg=np.degrees(hand_errors).tolist())
+            if not hand_target_reached:
+                result['hand_hold_command'] = hold_command.tolist()
+            self.event('move_arrived' if hand_target_reached else 'move_partial',
+                       elapsed_s=time.monotonic()-start, max_control_gap_s=max_gap, **result)
             if self.stop_requested.wait(self.motion.settle_s):
                 raise HardwareError("Stopped during settle")
+            return result
+        except StepTranslationRejected:
+            # _check_target rejected before hand.enable/moveL; no target was sent.
+            # Release the idle control script and let Session record a hold.
+            self._release_arm()
+            raise
         except BaseException as primary:
             try:
                 self.stop()

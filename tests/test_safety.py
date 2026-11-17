@@ -1,8 +1,10 @@
 """The executor rule and the checks that hold the robot."""
 import numpy as np
+import pytest
 
 from lawm_deploy.robot_model import pose
-from lawm_deploy.safety import Executor, SafetySettings, check
+from lawm_deploy.safety import Executor, SafetySettings, check, limit_finger_step
+from lawm_deploy.hardware_contract import hand_contract, HardwareError
 
 S = SafetySettings(max_step_mm=60, ori_alpha=0.5, max_rot_deg=30, max_finger_deg=60, max_joint_deg=30, max_fit_residual_mm=15,
                    box_lo=(-1, -1, 0), box_hi=(1, 1, 1), floor_z_m=0.0)
@@ -51,3 +53,33 @@ def test_model_frame_round_trip():
     inner = StandInModel()
     out = FramedModel(inner, R).decoder(coords, seg)(z)
     assert np.allclose(out, inner.decoder(coords @ R.T, seg)(z) @ R, atol=1e-6)
+
+
+@pytest.mark.parametrize('margin_deg', [.5, 1.])
+def test_finger_increment_clamp_preserves_limits_and_feedback(margin_deg):
+    names, bounds = hand_contract()
+    measured = np.zeros(22)
+    i = names.index('right_index_MCP_FE')
+    measured[i] = bounds[i, 0] - np.radians(.221)
+    target = measured.copy(); target[i] = np.radians(36)
+    original = measured.copy()
+    command, info = limit_finger_step(target, measured, bounds, 20., margin_deg)
+    assert info['finger_step_limited'] and info['finger_clipped_indices'] == [i]
+    assert info['commanded_finger_step_deg'] == pytest.approx(20. - margin_deg)
+    assert (command >= bounds[:, 0]).all() and (command <= bounds[:, 1]).all()
+    np.testing.assert_array_equal(measured, original)
+    normal, info = limit_finger_step(np.zeros(22), np.zeros(22), bounds, 20., margin_deg)
+    assert not info['finger_step_limited']
+    np.testing.assert_array_equal(normal, 0)
+
+
+def test_finger_clamp_absolute_bounds_nan_and_impossible_step():
+    _, bounds = hand_contract()
+    near_upper = bounds[:, 1] - np.radians(1)
+    command, info = limit_finger_step(bounds[:, 1] + .1, near_upper, bounds, 20., .5)
+    np.testing.assert_array_equal(command, bounds[:, 1])
+    assert info['finger_step_limited']
+    with pytest.raises(HardwareError):
+        limit_finger_step(np.full(22, np.nan), near_upper, bounds, 20.)
+    with pytest.raises(HardwareError, match='both absolute and step limits'):
+        limit_finger_step(np.zeros(22), bounds[:, 0] - 1, bounds, 20.)

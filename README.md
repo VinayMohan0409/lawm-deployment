@@ -1,218 +1,185 @@
-# lawm-deployment
+# LAWM deployment
 
-**Local UR7e/Sharpa integration:** see [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md) for the independent conda environment, SDK adapter and checks. Real hardware is read-only unless `--execute`, `--trial-step`, or `--trial-run` is supplied.
+Deploy the latent action world model on a UR arm, a right Sharpa Wave hand,
+and two calibrated RealSense cameras. Includes a Viser interface and a MuJoCo
+simulation backend.
 
-**Continuous supervised trial (operator-authorized existing setup):**
+The planner searches latent actions and predicts five steps of point-cloud
+motion. Hand fitting converts the prediction into a palm pose and 22 joint
+angles; the real backend checks controller IK and executes a flange `moveL`
+alongside timed finger commands.
+
+## Installation
+
+Python 3.10 and an editable installation of `latent-action-world-model` are
+required. The reference model revision is `5a2ccb8`. Model inference needs CUDA;
+the stand-in model and tests run without a GPU or checkpoint.
+
+For an existing environment:
+
 ```bash
-CUDA_VISIBLE_DEVICES=1 ./run_lawm.sh --trial-run
+python -m pip install -e ../latent-action-world-model
+python -m pip install -e '.[real,dev]'
 ```
-Open `http://localhost:8080`, keep **reach**, click **Capture start**, then **Run**.
-The saved goal is loaded automatically; do not Capture goal again. Each cycle
-observes the current scene and joints, replans, fits the hand, checks IK and executes
-one move. Run repeats automatically until a stop condition (at most 80 replans
-with the current config); **Stop** ends it. Every replan is logged. This mode uses
-the same accepted existing setup, motion limits and runtime checks as `--trial-step`,
-without the one-attempt limit. Commissioning flags remain unchanged.
 
-**First supervised real move (operator-authorized existing setup):**
+Install the model repository's CUDA dependencies and the vendor Sharpa SDK.
+If the SDK is not importable, set `SHARPA_SDK_PYTHON` to its Python module directory.
+For a separate Conda environment with the reference dependency versions:
+
 ```bash
-CUDA_VISIBLE_DEVICES=1 ./run_lawm.sh --trial-step
+./scripts/setup_environment.sh ../latent-action-world-model
+conda activate ./.conda/lawm
 ```
-Open `http://localhost:8080`, keep **reach**, click **Capture start**, optionally
-**Plan only**, then **Step (one move)**. The saved goal is loaded automatically;
-do not Capture goal again. Step captures fresh state and replans, so its command
-can differ from the preceding preview. It performs IK/path checks before moving.
-Only one move attempt is allowed per launch; **Run** and manual jog are disabled.
-If it holds, nothing moved; inspect the stated reason. Stop the process after the
-trial and review its logs before another launch. This mode records acceptance of
-the existing setup (including existing payload) without claiming outstanding
-physical commissioning checks passed. It preserves runtime safety checks and
-caps of 10 mm translation, 8 degrees wrist, 20 degrees fingers, 10 degrees arm
-joint excursion and the existing slow motion settings. No automatic reset occurs.
 
-**Current local trial (2026-11-12):** `configs/real.yaml` loads
-`/data2/xuchuan/lawm_samples/grasp_20261111_171635` and selects **reach**.
-The saved goal is fixed; the saved start is a reference only. Every real run/replan
-captures current joints and depth. There is no automatic move back to the saved start.
-Run `./run_lawm.sh` for live observation and Plan only; `--no-sample-pair` selects
-fresh goal/start capture instead. Stop other hardware owners before connecting.
-Ordinary `--execute` requires completed commissioning; `--trial-run` records the
-operator-authorized experimental exception for the existing setup.
-Environment setup, calibration conventions, log contents and execution limits
-are described in [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md).
+`LAWM_CONDA_EXE` selects the Conda executable; `LAWM_CONDA_PREFIX` overrides the
+environment location. The setup script does not connect to hardware.
 
-Runs a world model (LAWM) on a **UR7e + right Sharpa Wave hand + two RealSense D435i cameras**.
+Place the matched model files in `checkpoint/`; see [checkpoint/README.md](checkpoint/README.md).
+The weights, raw data, calibration and generated outputs are not tracked by Git.
 
-You set a goal pose and a start pose, pick **reach** or **grasp**, and press **Run**. On every replan the robot:
+## Configuration
 
-1. reads its joint angles and both depth cameras;
-2. lets the model choose the next hand motion;
-3. makes that one move;
-4. looks again.
-
-Each run is logged so it can be analysed afterwards.
-
-## What you need
-- A Linux PC with an NVIDIA GPU (11 GB or more).
-- **UR7e:** connected by Ethernet to the PC, on the same subnet. On the teach pendant:
-  - enable **Remote Control** (Settings → System → Remote Control), then switch the Local/Remote toggle at the top right to **Remote**; this lets the PC command the robot;
-  - make sure the **RTDE** service is not disabled (Settings → Security → Services); `ur_rtde` uses it to read and move the arm.
-
-  Menu names vary slightly between PolyScope versions.
-- **Sharpa Wave:** connected as its own documentation says, with **Sharpa Pilot** installed. Pilot installs the hand's Python SDK in `/opt/sharpa-wave-sdk/`.
-- **2× D435i:** a USB 3 cable each. After installing, list their serial numbers with
-  `python -c "import pyrealsense2 as rs; print([d.get_info(rs.camera_info.serial_number) for d in rs.context().devices])"`.
-- Read access to both GitHub repos (`latent-action-world-model`, `lawm-deployment`).
-
-## Install (once)
 ```bash
-conda create -n lawm python=3.10 && conda activate lawm
-# torch 2.5 + CUDA, spconv, torch_scatter, timm, addict, einops: see latent-action-world-model/requirements.md, section 2 (on x86: pip install spconv-cu12x)
-git clone https://github.com/VinayMohan0409/latent-action-world-model
-cd latent-action-world-model && git checkout 5a2ccb8 && pip install -e . && cd ..
-git clone https://github.com/VinayMohan0409/lawm-deployment
-cd lawm-deployment && pip install -e ".[real,dev]"
+cp configs/real.yaml configs/real.local.yaml
 ```
-The model files are already in `checkpoint/`.
 
-## Set up (once)
+Edit the local copy: robot IP, hand and camera serial numbers, mounting transform,
+camera calibration, workspace/table bounds, and optional restore paths. Values in
+`real.yaml` are examples, not a calibration of your installation.
 
-**1. Sharpa SDK adapter (implemented locally).**
-`SharpaHand` discovers the configured right hand, maps joints by name, converts degree feedback to radians, and sends radians. Connection is read-only; output is enabled only during an explicitly enabled move. No reset/open command is issued on startup.
+The launcher uses the active Python interpreter, or `LAWM_CONDA_PREFIX/bin/python`
+when configured. Configuration selection is `--config`, then `LAWM_CONFIG`, then
+`configs/real.local.yaml` if present, otherwise `configs/real.yaml`. Paths inside
+YAML are relative to this repository; absolute paths and `~` are also accepted.
+Use local storage for `log_dir` to avoid filesystem delays in the control loop.
 
-**2. Fill in `configs/real.yaml`.** Every line marked `CHANGE`:
-- the robot's IP address;
-- how the hand is mounted on the flange;
-- the camera serials (keep them in quotes), each with a rough tape-measured position and a point it looks at (metres, in the robot base frame);
-- the box the flange may move in;
-- the table height.
+Optional machine-specific environment settings can live outside the repository
+in `$XDG_CONFIG_HOME/lawm-deploy/environment.sh` (default
+`~/.config/lawm-deploy/environment.sh`). The launcher sources this file;
+`LAWM_LOCAL_ENV` selects another file. Keep personal configuration out of commits.
 
-**3. Camera extrinsics** (each camera's pose in the robot base frame).
-- If you already have them, write `configs/calibration.yaml`: declare `frame: depth_optical` and put matrices under `T_base_camera`, keyed by serial. Existing color-camera calibration must be converted with the camera-internal depth-to-color transform.
-- If not, run:
-  ```bash
-  python -m lawm_deploy.calibrate --config configs/real.yaml
-  ```
-  This command is read-only. Use the pendant to arrange 5 different poses, end pendant freedrive and wait until stationary before each capture, with the hand visible to both cameras and clear of the table. It prints, per camera, the share of points matched and **OK** (over 70%) or **SUSPECT**. SUSPECT results are not written; existing calibration files are not overwritten. On SUSPECT, re-measure the rough pose (it needs to be within about 3 cm and 5°) and run it again.
+Camera calibration is a YAML file with `frame: depth_optical` and
+`T_base_camera`, mapping each camera serial to its 4×4 camera-to-base matrix.
+The base frame is the UR controller base, z-up, in metres, with zero TCP offset.
+`python -m lawm_deploy.calibrate --config configs/real.local.yaml` provides a
+robot-surface ICP calibration helper. Its matching score is not an independent
+measurement of calibration accuracy.
 
-**4. Check the hardware and geometry.**
-For device-only feedback (no depth calibration or LAWM required), use `./run_lawm.sh --check --devices`. The UI below still needs the LAWM library, even with a stand-in model. It does not enable motion:
+## Capture and run
+
+Arrange the hand and scene at the desired goal, then capture into a new directory:
+
 ```bash
-python -m lawm_deploy --config configs/real.yaml --standin
+./run_lawm.sh --capture-goal goals/cup_grasp_01
 ```
-Open `http://localhost:8080`, then:
-- **Overlay check:** tick **Show raw camera points**. The red camera points must sit on the blue hand (drawn from the joint angles) in a few different arm poses. If they're offset, fix the extrinsics or the mount before going on.
-- **Workspace box:** in **1. Workspace**, set the box to the table area the hand works in and press **Save box to config**. Keep it the same for every trial.
 
-## Each trial
-After independently verifying mount geometry, depth calibration, workspace/table and TCP/payload, record those checks under `commissioning` in `configs/real.yaml`. Start with `python -m lawm_deploy --config configs/real.yaml --execute` and open `http://localhost:8080`. Without `--execute`, only observation and Plan only are available; controller IK is not queried.
+This reads the cameras and joints without commanding motion. It saves `goal.npz`
+and PLY previews. A goal needs depth, calibration and joint state; a PLY alone
+cannot replace `goal.npz`. Existing captures are not overwritten.
 
-1. **Goal:** put the robot and objects where they should end up, then press **Capture goal**. In **Arrange the robot**:
-   - **Teleoperation mode:** releases the UR controller and disconnects the Sharpa SDK. Stop teleoperation and take control back before capturing; this integration does not assume concurrent Sharpa SDK readers.
-   - **Freedrive and the finger slider:** to place it by hand instead.
-2. **Start:** arrange the start the same way, then press **Capture start**. Untick **Teleoperation mode** (and stop your teleop system) before the next step.
-3. **Run:** pick the task and press **Run**. The status line shows the replan number, the distance to the goal hand, and why the robot held if it did.
+Arrange the start scene. Preview a plan without motion:
 
-A run ends by itself:
-- with **success** when the hand stays within 5 cm of the goal hand for 5 replans in a row (hand-goal attainment only, not proof of a successful grasp);
-- when it stalls, after 5 holds in a row, or after 80 replans;
-- or when you press **Stop**. The execution loop checks this during motion and before sending a planned move; this is not a physical e-stop.
-
-**For emergencies use the pendant's e-stop.**
-
-**Model frame:** keep `training_up=[-0.022,-0.546,-0.837]`, `spin_deg=315`, 1024 hand points and 5120 scene points fixed for this checkpoint.
-
-**Please send back** the session folder, its linked hardware journal and a phone video of each run.
-
-For this local installation, logs are under `/data2/xuchuan/lawm_runs`.
-Inputs, predictions and commands are saved before execution; post-action observations,
-Plan only metrics, failure stages and Step/Run status are saved as well. Include the linked
-`hardware_*.jsonl` at the log root. Real RGB video is not recorded automatically; use a
-separate video recording. File details are in [DEPLOYMENT_LOCAL.md](DEPLOYMENT_LOCAL.md).
-
-## If something is off
-
-| Problem | Setting in `configs/real.yaml` |
-|---|---|
-| Moves too fast or slow | `cell.motion` (start slow) |
-| Arm or hand points left in the cloud | raise `perception.robot_margin_m` |
-| Robot keeps holding | the status line says why; adjust the matching `safety` setting |
-| Grasp approach too high for your space | lower `planner.gates.hover.margin_mm` (200) |
-
-Leave the other planner settings as they are.
-
-The robot holds instead of moving when:
-- the hand fit is poor;
-- the UR has no IK solution, or the arm path exceeds the configured joint excursion;
-- wrist or finger motion exceeds the configured limits;
-- the flange would leave the box;
-- the hand would go below `floor_z_m`.
-
-The local real configuration caps each move at 10 mm, wrist rotation at 8 degrees, and finger changes at 20 degrees (rotation/finger limits increased with user authorization on 2026-11-12 after reviewing live plans); simulation retains the original limits. `moveL` and minimum-jerk fingers use approximately matched timing, not a shared servo clock. Arrival, feedback and runtime limits are checked. See DEPLOYMENT_LOCAL.md for the remaining execution limitations.
-
-## Not verified yet
-- A supervised real trial has been performed; task success and physical commissioning remain separate checks.
-- Teleoperation handover now disconnects the hand rather than assuming concurrent SDK readers. Hardware validation is pending.
-- The UR7e is modelled with the UR5e's kinematics. The overlay check in setup step 4 will show if that's wrong.
-
-## Simulation (no hardware)
-`configs/sim.yaml` is a MuJoCo copy of the cell.
 ```bash
-MUJOCO_GL=osmesa python -m lawm_deploy --config configs/sim.yaml   # same page, with a Simulation panel
-MUJOCO_GL=osmesa python -m lawm_deploy.sim_demo --task grasp        # example goal and start, one run
-MUJOCO_GL=osmesa pytest tests
-```
-For a trial in simulation:
-1. In **Simulation**, press **Example reach/grasp goal**, then **Move**, then **Capture goal**.
-2. Press **Reset scene**, then **Capture start**.
-3. Press **Run**.
-
-Each run saves `video.mp4` in its run folder.
-
-## How the code fits together
-
-One replan, start to end:
-```
-cell.state() ──> joint angles, flange pose ──> hand.py: 1024 hand points (FK on the Sharpa mesh)
-cell.views() ──> 2 depth images ──> perception.py: base-frame points, box crop, robot removed, 1.5 cm voxels, 5120 points
-                                         │
-                hand + scene cloud ──────┴──> model.py: rotate into the training frame ──> lawm planner (CEM over latent actions,
-                                              cost against the goal hand) ──> predicted step 1 of the hand points
-                                                                                   │
-safety.py <── hand.py: fit palm pose + 22 angles to those points <─────────────────┘
-   │  executor: flange target (configured step cap, rotation smoothed); checks: fit, IK, jumps, box, floor ──> hold if any fails
-   └──> cell.move(): moveL for the arm + smooth finger targets ──> observe again
+./run_lawm.sh --goal goals/cup_grasp_01
 ```
 
-```
-lawm-deployment/
-├── README.md
-├── pyproject.toml               dependencies (pip install -e ".[real,dev]")
-├── configs/
-│   ├── real.yaml                every setting for the real cell (CHANGE lines must be set)
-│   ├── sim.yaml                 the same for the MuJoCo copy of the cell
-│   └── calibration.yaml         camera extrinsics (yours, or written by calibrate.py; not in git)
-├── checkpoint/                  best.pt (model), run_manifest.json (its settings), prior.npz (latent prior)
-├── assets/                      Sharpa Wave right hand and UR5e models (MuJoCo Menagerie)
-├── lawm_deploy/
-│   ├── __main__.py              python -m lawm_deploy: connects the cell, loads the model, serves the page
-│   ├── ui.py                    the browser page (viser): workspace box, captures, Plan/Step/Run/Stop, teleop, sim panel
-│   ├── session.py               one experiment: capture goal/start, the replan loop, stop rules, logs in runs/
-│   ├── perception.py            depth images -> hand + scene cloud
-│   ├── hand.py                  Sharpa hand points from joint angles, and the fit of angles to points
-│   ├── robot_model.py           UR + Sharpa kinematics (flange, palm, surface points to mask the robot)
-│   ├── model.py                 loads the checkpoint + prior, training-frame rotation, stand-in model for tests
-│   ├── safety.py                predicted hand -> flange/finger command, and the checks that hold the robot
-│   ├── cell.py                  real hardware: UR (ur_rtde), Sharpa (SharpaHand: implemented locally), D435i (pyrealsense2)
-│   ├── sim_cell.py              MuJoCo copy of the cell with simulated depth cameras and video recording
-│   ├── calibrate.py             camera extrinsics by matching depth points to the robot's own surface
-│   ├── config.py                reads the YAML configs
-│   └── sim_demo.py              one example run in simulation without the page
-├── tests/                       pytest (CPU): kinematics, perception, safety, calibration, loop, real cell on fakes
-└── runs/                        logs and videos of every run (created when you run; send these back)
-```
-The planner itself (search, costs, grasp hover gate, hand fit) lives in `latent-action-world-model` under `src/lawm/sim/dexwm/`; this repo only calls it.
+Open `http://localhost:8080`, select the task, click **Capture start**, then
+**Plan only**. Enable closed-loop execution with:
 
-## Credits
-- Robot models: [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) (Sharpa Wave: Apache-2.0; UR5e: BSD-3-Clause; licences in `assets/`).
-- Voxel sampling: as in [PointWorld](https://github.com/NVlabs/PointWorld).
+```bash
+./run_lawm.sh --trial-run --goal goals/cup_grasp_01 --execute-steps 3
+```
+
+Click **Capture start**, then **Run**. **Stop** ends execution.
+`--trial-step` permits one move attempt. `--execute` also exposes manual arrangement
+and teleoperation handover controls. All execution modes use the same configured
+motion limits. No robot movement occurs automatically on startup unless `--restore`
+is explicitly requested.
+
+The model predicts five targets. `--execute-steps` selects 1–5 successive targets
+per inference; the default is 1. Every target gets fresh measured state, IK and
+execution checks. A held or partially tracked move, finger clipping, task-phase
+change or Stop discards remaining targets and forces replanning. Manual **Step**
+always makes a fresh plan.
+
+Optional return to a recorded arm pose:
+
+```bash
+./run_lawm.sh --restore path/to/initial_pose.json --open-hand
+```
+
+Set `restore.script`, `restore.config` and `restore.preset` for the external
+collection tool. The adapter expects its `ur_joint_pose.py` interface:
+`--config`, `--restore`, `--execute`, and `--arm-only`. `--open-hand` requests its
+full reset including finger opening; otherwise restore is arm-only. Restore can
+be combined with `--trial-run --goal ...`. The collection tool and its SDK
+requirements are installed separately.
+
+## Tasks and execution
+
+- **reach:** move the whole-hand points toward the goal, penalising predicted scene motion.
+- **grasp:** approach a raised hand goal, then the captured grasp pose.
+- **place/push:** not exposed here. Place in the upstream simulation requires
+  object labels and contact-stage costs; real perception currently combines
+  object and background points into one scene segment. Reach is not a push objective.
+
+Keep the reference model's training-frame rotation and point counts fixed:
+1024 FK hand points and 5120 scene points. Training steps represent 0.2 seconds;
+real execution is observe–plan–move–settle–observe, without a 5 Hz requirement.
+
+The example real configuration caps planned translation at 60 mm, with a 2 mm
+FK/controller margin in the execution check. Wrist, arm and finger increments
+have separate limits. Feedback may exceed a hand model bound by up to 1 degree;
+commands remain within the joint bounds. Large finger increments are clamped and
+followed by replanning. Arm and finger commands do not share a servo clock.
+
+After arm arrival and timed finger motion, fingers get up to one extra second to
+settle. A remaining hand-target error within the following-error guard yields a
+partial result: hold measured fingers, observe, and replan. Arm non-arrival,
+communication faults, excessive feedback errors and user Stop still terminate
+motion. These checks do not provide full arm/scene collision detection.
+
+Success means the mean distance between corresponding FK hand points and goal
+points is **below 10 mm for five consecutive checks** in the real configuration.
+It does not establish physical grasp, push or placement success.
+
+## Logs
+
+`log_dir/<session>/<run>/` contains:
+
+- `run.json`, `status.json`, `records.jsonl`, `events.jsonl`: configuration,
+  checkpoint provenance, progress and termination reason.
+- `goal.npz`, `start.npz`, `run_start.npz`: the goal and initial observations.
+- `input_replan_*.npz`, `prediction_replan_*.npz`, `command_replan_*.npz`,
+  `replan_*.npz`, `after_replan_*.npz`: measured inputs, predictions, fitted and
+  bounded targets, and post-move observations, including raw depth when available.
+
+`run.json` links the hardware journal in `log_dir`. Include it, the run directory
+and the original goal capture when sharing a trial. Real video must be recorded
+separately. The simulation backend records video.
+
+Export saved observations to PLY with:
+
+```bash
+python -m lawm_deploy.observation_io goals/cup_grasp_01/goal.npz exports/cup_goal
+```
+
+## Simulation and tests
+
+```bash
+./run_lawm.sh --config configs/sim.yaml --standin
+python -m lawm_deploy.sim_demo --config configs/sim.yaml --standin --task reach
+PYTHONDONTWRITEBYTECODE=1 MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa OMP_NUM_THREADS=1 \
+  python -m pytest -q -p no:cacheprovider
+```
+
+Tests use simulated or fake devices, not real robot connections. The arm model
+uses UR5e kinematics as the nominal model for this UR7e setup. Verify the FK and
+camera overlay for your hardware.
+
+`./run_lawm.sh --check` checks packages/checkpoint compatibility without connecting
+to devices. `--observe-only` explicitly captures read-only hardware feedback.
+
+Bundled robot assets retain their licenses in `assets/sharpa_wave/` and
+`assets/universal_robots_ur5e/`. The world model, weights and vendor SDK are separate
+dependencies.

@@ -4,10 +4,6 @@
 > Requires MuJoCo 3.1.6 or later (for the `dampratio` attribute on position
 > actuators).
 
-## Changelog
-
-See [CHANGELOG.md](./CHANGELOG.md) for a full history of changes.
-
 ## Overview
 
 This package contains a simplified robot description (MJCF) of the **Sharpa
@@ -16,17 +12,13 @@ Wave** five-fingered tactile hand developed by
 freedom across the thumb (5 DoF), index/middle/ring fingers (4 DoF each), and
 pinky (5 DoF), and integrates Sharpa's
 [fingertip tactile sensors](https://www.sharpa.com/pages/wave) modelled here
-as the green elastomer pads on each distal phalange. Both left- and
-right-handed versions are provided.
+as the green elastomer pads on each distal phalange. This repository bundles the right-handed model and its required meshes.
 
 The model is derived from the URDF and assets published at
 [sharpa-robotics/sharpa-urdf-usd-xml](https://github.com/sharpa-robotics/sharpa-urdf-usd-xml)
 (commit
 [`6eea427eb24189519f32b9f21674cd534d3f973c`](https://github.com/sharpa-robotics/sharpa-urdf-usd-xml/commit/6eea427eb24189519f32b9f21674cd534d3f973c)).
 
-<p float="left">
-  <img src="sharpa_wave.png" width="400">
-</p>
 
 ## URDF → MJCF derivation steps
 
@@ -88,7 +80,7 @@ The model is derived from the URDF and assets published at
 
 ### Right Hand
 
-Generated from `left_hand.xml` by [`make_right.py`](./make_right.py)
+Generated from `left_hand.xml` by `make_right.py` in the upstream asset package
 (`uv run make_right.py`; deps are declared inline via PEP 723). The upstream
 `right_sharpa_wave.urdf` is authored independently of the left and uses
 divergent body-frame conventions, so it is not used here. The script:

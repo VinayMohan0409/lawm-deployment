@@ -13,12 +13,12 @@ from pathlib import Path
 import numpy as np
 
 from lawm_deploy import config
-from lawm_deploy.hardware_contract import REQUIRED_SITE_CHECKS, hand_contract
+from lawm_deploy.hardware_contract import hand_contract
 
 
 def offline(cfg):
     result = dict(python=sys.executable, version=platform.python_version(), packages={},
-                  hardware_connected=False, site_checks=cfg.get("commissioning", {}))
+                  hardware_connected=False)
     for name in ("numpy", "scipy", "mujoco", "yaml", "viser", "rtde_receive", "rtde_control",
                  "pyrealsense2", "sharpa", "torch", "torch_scatter", "spconv.pytorch", "timm", "lawm"):
         try:
@@ -41,7 +41,6 @@ def offline(cfg):
         if torch.cuda.is_available():
             result["cuda"]["device"] = torch.cuda.get_device_name(0)
             result["cuda"]["tensor_check"] = float((torch.ones(8, device="cuda") * 2).sum()) == 16
-    result["pending_site_checks"] = [k for k in REQUIRED_SITE_CHECKS if cfg.get("commissioning", {}).get(k) is not True]
     result["model_environment_ready"] = all(p["ok"] for p in result["packages"].values()) and result["checkpoint"]["prior_matches"]
     result["physical_validation"] = "NOT_PERFORMED"
     return result

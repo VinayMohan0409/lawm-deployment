@@ -23,6 +23,7 @@ class SafetySettings:
     box_lo: tuple
     box_hi: tuple
     floor_z_m: float
+    execution_step_margin_mm: float = 0.0  # controller/FK discrepancy, not planner motion
 
 
 class Executor:
@@ -52,6 +53,33 @@ class Executor:
         self.last_rotvec = Rotation.from_matrix(target[:3, :3]).as_rotvec()
 
 
+def limit_finger_step(target, measured, bounds, max_deg, margin_deg=0.0):
+    """Bound each commanded increment and absolute joint angle, keeping raw inputs intact.
+
+    Leave a small feedback margin below the hardware step guard. If feedback is
+    too far outside absolute bounds to produce a bounded step, reject it.
+    """
+    target = vector(target, 22, 'requested finger target')
+    measured = vector(measured, 22, 'measured fingers')
+    bounds = np.asarray(bounds, dtype=float)
+    if bounds.shape != (22, 2) or not np.isfinite(bounds).all() or np.any(bounds[:, 0] > bounds[:, 1]):
+        raise HardwareError('Invalid finger bounds')
+    if not np.isfinite(max_deg) or max_deg <= 0 or not np.isfinite(margin_deg) or margin_deg < 0:
+        raise HardwareError('Invalid finger step limit/margin')
+    cap_deg = max_deg - min(margin_deg, max_deg / 2)
+    cap = np.radians(cap_deg)
+    lo = np.maximum(bounds[:, 0], measured - cap)
+    hi = np.minimum(bounds[:, 1], measured + cap)
+    if np.any(lo > hi):
+        raise HardwareError('No finger target satisfies both absolute and step limits')
+    command = np.clip(target, lo, hi)
+    clipped = np.flatnonzero(np.abs(command - target) > 1e-10)
+    return command, dict(finger_step_limited=bool(len(clipped)),
+        finger_clipped_indices=clipped.tolist(), finger_command_cap_deg=float(cap_deg),
+        requested_finger_step_deg=float(np.degrees(np.abs(target-measured).max())),
+        commanded_finger_step_deg=float(np.degrees(np.abs(command-measured).max())))
+
+
 def check(settings, target, q_hand, q_hand_now, flange_now, q_arm_now, q_arm_ik, fit_info, hand_points):
     """None if the command is safe to send, else the reason to hold: bad fit, no IK or a joint jump, a large rotation or finger jump, the flange outside the box, a hand point below the floor height."""
     s = settings
@@ -76,7 +104,7 @@ def check(settings, target, q_hand, q_hand_now, flange_now, q_arm_now, q_arm_ik,
     if rot > s.max_rot_deg:
         return f"wrist rotation {rot:.1f} deg > {s.max_rot_deg}"
     finger = float(np.degrees(np.abs(q_hand - q_hand_now).max()))
-    if finger > s.max_finger_deg:
+    if finger > s.max_finger_deg + 1e-6:
         return f"finger jump {finger:.1f} deg > {s.max_finger_deg}"
     if not ((target[:3, 3] >= s.box_lo).all() and (target[:3, 3] <= s.box_hi).all()):
         return f"flange target {np.round(target[:3, 3], 3).tolist()} outside the box"

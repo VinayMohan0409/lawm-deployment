@@ -167,6 +167,30 @@ def test_single_step_success_finalizes_without_run(cell, tmp_path):
     assert (s.run_dir / 'after_replan_000.npz').exists()
 
 
+def test_translation_rejection_holds_then_replans(cell, tmp_path, monkeypatch):
+    from lawm_deploy.hardware_contract import StepTranslationRejected
+    s, _ = started(cell, tmp_path)
+    s.begin('reach')
+    move = cell.move
+    initial_rotation = s.executor.last_rotvec.copy()
+    def reject(*args):
+        raise StepTranslationRejected('Flange translation exceeds step limit: 12.1 mm > 12 mm')
+    monkeypatch.setattr(cell, 'move', reject)
+    record = s.step()
+    assert not record['moved'] and record['stop'] is None
+    assert 'step limit' in record['hold'] and s.holds == 1
+    np.testing.assert_array_equal(s.executor.last_rotvec, initial_rotation)
+    status = json.loads((s.run_dir / 'status.json').read_text())
+    assert not status['loop_ended'] and status['error'] is None
+    events = [json.loads(line) for line in (s.run_dir / 'events.jsonl').read_text().splitlines()]
+    assert any(e['event'] == 'execution_hold' and not e['motion_sent'] for e in events)
+    monkeypatch.setattr(cell, 'move', move)
+    assert s.step()['moved'] and s.holds == 0
+    # Repeated rejection still ends through the existing bounded hold policy.
+    monkeypatch.setattr(cell, 'move', reject)
+    assert s.run() == 'too many holds'
+
+
 def test_stop_halts_a_move(cell):
     """With Stop requested, a long move ends early and the robot holds."""
     _, _, flange = cell.state()
@@ -189,3 +213,115 @@ def test_unsent_commands_do_not_change_the_executor():
     assert np.allclose(ex.last_rotvec, 0)
     ex.sent(turned)
     assert np.allclose(ex.last_rotvec, Rotation.from_euler("z", 20, degrees=True).as_rotvec())
+
+
+def chunk_session(cell, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from dataclasses import replace
+    s, _ = started(cell, tmp_path)
+    s.execute_steps = 3
+    s.begin('reach')
+    s.loop = replace(s.loop, max_replans=4, success_replans=99)
+    calls = []
+    def plan(coords, replan):
+        calls.append(coords.copy())
+        delta = np.zeros((5, *coords.shape), dtype=np.float32)
+        delta[:, s.current.segment == SEG_HAND, 2] = -np.arange(1, 6)[:, None] * .005
+        result = SimpleNamespace(delta=delta, executed='best_sample', cost=0., final_hand_error_mm=0.)
+        return coords[s.current.segment == SEG_HAND] + delta[0, s.current.segment == SEG_HAND], result
+    monkeypatch.setattr(s.planner, 'plan', plan)
+    return s, calls
+
+
+def test_run_consumes_three_cumulative_targets_then_replans(cell, tmp_path, monkeypatch):
+    s, calls = chunk_session(cell, tmp_path, monkeypatch)
+    assert s.run() == 'max replans'
+    assert len(calls) == 2 and all(r['moved'] for r in s.records)
+    assert [r['predicted_step'] for r in s.records] == [1, 2, 3, 1]
+    assert [r['reused_plan'] for r in s.records] == [False, True, True, False]
+    for i in range(3):
+        with np.load(s.run_dir / f'prediction_replan_{i:03d}.npz') as saved:
+            expected = calls[0][s.current.segment == SEG_HAND] + [0, 0, -.005 * (i + 1)]
+            np.testing.assert_allclose(saved['hand_target'], expected, atol=1e-7)
+            assert json.loads(str(saved['plan_metadata_json']))['plan_source_replan'] == 0
+    status = json.loads((s.run_dir / 'status.json').read_text())
+    assert status['planning_calls'] == 2 and status['step_attempts'] == 4
+    assert s.pending_plan is None
+
+
+def test_chunk_rejection_discards_remainder_and_manual_step_always_replans(cell, tmp_path, monkeypatch):
+    from lawm_deploy.hardware_contract import StepTranslationRejected
+    s, calls = chunk_session(cell, tmp_path, monkeypatch)
+    move = cell.move
+    attempts = []
+    def reject_second(*args):
+        attempts.append(1)
+        if len(attempts) == 2:
+            raise StepTranslationRejected('Flange translation exceeds step limit')
+        return move(*args)
+    monkeypatch.setattr(cell, 'move', reject_second)
+    assert s.step(reuse_plan=True)['moved']
+    assert not s.step(reuse_plan=True)['moved']
+    assert s.pending_plan is None
+    record = s.step(reuse_plan=True)
+    assert record['moved'] and record['predicted_step'] == 1 and len(calls) == 2
+    # A manual Step must not silently consume the second target of that plan.
+    record = s.step()
+    assert record['moved'] and not record['reused_plan'] and len(calls) == 3
+
+
+def test_chunk_stop_discards_pending_targets(cell, tmp_path, monkeypatch):
+    s, calls = chunk_session(cell, tmp_path, monkeypatch)
+    s.run(should_stop=lambda: len(s.records) >= 1)
+    assert len(calls) == 1 and len(s.records) == 1 and s.pending_plan is None
+
+
+def test_partial_motion_records_actual_state_and_forces_fresh_plan(cell, tmp_path, monkeypatch):
+    s, calls = chunk_session(cell, tmp_path, monkeypatch)
+    move = cell.move
+    def partial_move(target, fingers):
+        # The arm moves, but the fingers keep their measured starting pose.
+        _, actual_hand, _ = cell.state()
+        move(target, actual_hand)
+        _, actual_hand, _ = cell.state()
+        return dict(hand_target_reached=False, outcome='hand_target_not_reached',
+                    hand_actual=actual_hand.tolist(), hand_target=fingers.tolist())
+    monkeypatch.setattr(cell, 'move', partial_move)
+    before = s.current.flange.copy()
+    record = s.step(reuse_plan=True)
+    assert record['moved'] and record['partial_motion'] and record['hold'] is None
+    assert not record['motion_result']['hand_target_reached']
+    assert s.pending_plan is None and s.holds == 0
+    assert not np.allclose(before, s.current.flange)
+    with np.load(s.run_dir / 'after_replan_000.npz') as saved:
+        np.testing.assert_allclose(saved['q_hand'], record['motion_result']['hand_actual'])
+    saved_record = json.loads((s.run_dir / 'records.jsonl').read_text().splitlines()[0])
+    assert saved_record['partial_motion'] and saved_record['motion_result'] == record['motion_result']
+    again = s.step(reuse_plan=True)
+    assert again['predicted_step'] == 1 and len(calls) == 2
+    with np.load(s.run_dir / 'after_replan_000.npz') as saved:
+        hand = saved['segment'] == SEG_HAND
+        np.testing.assert_allclose(calls[1][hand], saved['coords'][hand])
+
+
+def test_clamped_fingers_move_and_force_fresh_plan(cell, tmp_path, monkeypatch):
+    from dataclasses import replace
+    s, calls = chunk_session(cell, tmp_path, monkeypatch)
+    s.safety = replace(s.safety, max_finger_deg=20.)
+    fit = s.hand.fit
+    def large_finger_target(points, q_init):
+        rotation, position, joints, info = fit(points, q_init)
+        joints[5] = .6
+        return rotation, position, joints, info
+    monkeypatch.setattr(s.hand, 'fit', large_finger_target)
+    record = s.step(reuse_plan=True)
+    assert record['moved'] and record['hold'] is None and record['finger_step_limited']
+    assert record['requested_finger_step_deg'] > 20
+    assert record['commanded_finger_step_deg'] <= 20 + 1e-6
+    assert s.pending_plan is None and s.holds == 0
+    with np.load(s.run_dir / 'command_replan_000.npz') as saved:
+        assert saved['requested_fingers'][5] == pytest.approx(.6)
+        assert saved['fingers'][5] < saved['requested_fingers'][5]
+        assert json.loads(str(saved['plan_metadata_json']))['finger_step_limited']
+    s.step(reuse_plan=True)
+    assert len(calls) == 2

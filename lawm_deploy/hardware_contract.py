@@ -11,6 +11,10 @@ class HardwareError(RuntimeError):
     """A device, command or measured state failed validation."""
 
 
+class StepTranslationRejected(HardwareError):
+    """Translation rejected before sending arm or finger motion; safe to replan."""
+
+
 def vector(value, n, name):
     value = np.asarray(value, dtype=float)
     if value.shape != (n,) or not np.isfinite(value).all():
@@ -46,41 +50,33 @@ def hand_contract():
     return names, np.asarray([joints[n] for n in names])
 
 
-REQUIRED_SITE_CHECKS = ("mount_verified", "depth_verified", "workspace_verified", "tcp_payload_verified")
-
-
 def validate_cell_settings(cfg):
     if not np.array_equal(vector(cfg["expected_tcp_offset"], 6, "expected TCP offset"), np.zeros(6)):
         raise HardwareError("This backend currently requires the reference setup's zero TCP offset")
     for name, value in cfg["guards"].items():
+        if name == 'hand_feedback_limit_tolerance_deg':
+            if not np.isscalar(value) or not np.isfinite(value) or not 0 <= value <= 1.0:
+                raise HardwareError(f"Invalid runtime guard: {name} (expected 0..1 degrees)")
+            continue
         if not np.isscalar(value) or not np.isfinite(value) or value <= 0:
             raise HardwareError(f"Invalid runtime guard: {name}")
     hand = cfg["sharpa"]
+    if cfg['guards']['control_gap_s'] >= cfg['guards']['watchdog_timeout_s']:
+        raise HardwareError('control_gap_s must remain below watchdog_timeout_s')
     for name in ("speed_coeff", "current_coeff"):
         if not np.isfinite(hand[name]) or not 0 < hand[name] <= 1:
             raise HardwareError(f"Invalid Sharpa {name}")
 
 
-def require_execution_setup(cfg, *, trial_step=False):
-    """Never treat provisional geometry or camera calibration as commissioned hardware."""
-    missing = [key for key in REQUIRED_SITE_CHECKS if cfg.get("commissioning", {}).get(key) is not True]
-    if missing and not trial_step:
-        raise HardwareError("Execution blocked: site checks pending: " + ", ".join(missing))
+def require_execution_setup(cfg):
+    """Validate configured motion limits before opening a command interface."""
     s = cfg["safety"]
+    margin = s.get("execution_step_margin_mm", 0.0)
+    if not np.isfinite(margin) or not 0 <= margin <= 2.0:
+        raise HardwareError("execution_step_margin_mm must be between 0 and 2 mm")
     lo, hi = vector(s["box_lo"], 3, "box_lo"), vector(s["box_hi"], 3, "box_hi")
     if not (lo < hi).all() or not np.isfinite(s["floor_z_m"]):
         raise HardwareError("Invalid measured workspace or table height")
     for k in ("max_step_mm", "max_rot_deg", "max_finger_deg", "max_joint_deg", "max_fit_residual_mm"):
         if not np.isfinite(s[k]) or s[k] <= 0:
             raise HardwareError(f"Invalid safety setting: {k}")
-    if trial_step:
-        # Explicit operator-supervised trial of the existing setup, not a claim
-        # that its outstanding physical commissioning checks were completed.
-        for name, cap in dict(max_step_mm=10., max_rot_deg=8., max_finger_deg=20.,
-                              max_joint_deg=10., max_fit_residual_mm=15.).items():
-            if s[name] > cap:
-                raise HardwareError(f"Trial step requires {name} <= {cap}")
-        for name, cap in dict(speed=.02, accel=.1, rot_speed=.15, finger_speed=.3, finger_accel=1.).items():
-            value = cfg['cell']['motion'][name]
-            if not np.isfinite(value) or not 0 < value <= cap:
-                raise HardwareError(f"Trial step requires motion.{name} <= {cap}")

@@ -18,7 +18,16 @@ def load(path):
 
 def repo_path(p):
     """A config path made absolute against the repo root."""
-    return Path(p) if Path(p).is_absolute() else REPO / p
+    path = Path(p).expanduser()
+    return path if path.is_absolute() else REPO / path
+
+
+def execution_steps(cfg):
+    """Number of successive predicted targets consumed by Run per model call."""
+    value = cfg.get('experiment', {}).get('execute_steps', 1)
+    if type(value) is not int or not 1 <= value <= 5:
+        raise ValueError('experiment.execute_steps must be an integer from 1 to 5')
+    return value
 
 
 def mount_pose(cfg):

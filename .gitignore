@@ -12,3 +12,10 @@ htmlcov/
 build/
 dist/
 .venv/
+.conda/
+goals/
+exports/
+checkpoint/*
+!checkpoint/README.md
+configs/*.local.yaml
+.env.local

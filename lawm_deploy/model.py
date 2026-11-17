@@ -60,4 +60,6 @@ def load_model(cfg):
     checkpoint = repo_path(m["checkpoint"])
     model = model_adapter.load_model(checkpoint, repo_path(m["manifest"]), torch.device("cuda"))
     adapter = model_adapter.ModelAdapter(model, model_adapter.load_prior(repo_path(m["prior"]), checkpoint))
-    return FramedModel(adapter, model_frame(m["training_up"], m["spin_deg"]))
+    framed = FramedModel(adapter, model_frame(m["training_up"], m["spin_deg"]))
+    framed.checkpoint_sha256 = model_adapter.checkpoint_sha256(checkpoint)
+    return framed

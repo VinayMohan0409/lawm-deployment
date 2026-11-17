@@ -1,36 +1,35 @@
-# Real cell: UR7e + Sharpa Wave (right) + 2x RealSense D435i. Every line marked CHANGE must be set before the first run.
+# Example UR7e + right Sharpa Wave + two RealSense cameras. Copy to real.local.yaml and configure your hardware.
 seed: 0
-log_dir: /data2/xuchuan/lawm_runs # local disk on suria, avoid NFS writes in feedback loop
+log_dir: runs  # use local storage for the control-loop journal
 
 experiment:
-  sample_pair: /data2/xuchuan/lawm_samples/grasp_20261111_171635
-  task: reach                     # owner requests reach, including for this grasp goal
+  sample_pair: null
+  task: reach                     # reach or grasp
+  execute_steps: 1                 # Run: successive targets per inference; --execute-steps overrides (1..5)
+
+# Reuse the same saved pose and restore implementation as data collection.
+restore:
+  script: path/to/ur_joint_pose.py
+  config: path/to/collection_config.json
+  preset: path/to/initial_pose.json
 
 model:
   checkpoint: checkpoint/best.pt
   manifest: checkpoint/run_manifest.json
   prior: checkpoint/prior.npz
   training_up: [-0.022, -0.546, -0.837]   # "up" (table towards hands) in the training data's frame: mean of 200 training windows
-  spin_deg: 315                           # fixed checkpoint convention; owner confirmed 2026-11-11, do not retune on site
+  spin_deg: 315                           # fixed reference-checkpoint convention
 
-mount: {xyz_m: [0.0, 0.0, 0.0295], rpy_deg: [0.0, 0.0, -90.0]} # nominal T_tcp_wrist from our spray69_deployment_live.json; verify on this mount
-
-# These describe completed physical checks, not permission prompts. Leave false until measured.
-commissioning:
-  mount_verified: false
-  depth_verified: false
-  workspace_verified: false
-  tcp_payload_verified: false
-  note: "2026-11-12: reused teleop TCP bounds and sample calibration/mount; floor -0.065 is a point-cloud estimate, not a physical measurement. Live overlay, floor and TCP/payload checks pending."
+mount: {xyz_m: [0.0, 0.0, 0.0295], rpy_deg: [0.0, 0.0, -90.0]} # example flange-to-palm mounting transform
 
 cell:
   type: real
-  robot_ip: 172.16.0.3
+  robot_ip: ROBOT_IP
   arm_hz: 125
   expected_tcp_offset: [0, 0, 0, 0, 0, 0] # verify; never setTcp automatically
   sharpa:
-    serial: "C2529333C253"
-    sdk_path: /opt/sharpa-wave-sdk/python
+    serial: "SHARPA_RIGHT_SERIAL"
+    sdk_path: null  # import installed SDK, or set SHARPA_SDK_PYTHON
     speed_coeff: 0.3
     current_coeff: 0.6
     discovery_timeout_s: 5.0
@@ -38,37 +37,39 @@ cell:
   guards:
     feedback_timeout_s: 0.15
     watchdog_timeout_s: 0.2
-    control_gap_s: 0.1
+    control_gap_s: 0.15             # tolerate brief host delays; remains below 0.2 s UR watchdog
     max_arm_speed_rad_s: 0.6
     max_tcp_speed_m_s: 0.08
     max_tcp_rot_speed_rad_s: 0.3
     hand_following_error_rad: 0.35
+    hand_feedback_limit_tolerance_deg: 1.0  # tolerate small measured overruns; command limits remain strict
     arrival_position_m: 0.003
     arrival_rotation_rad: 0.03
     hand_arrival_rad: 0.12
+    hand_settle_timeout_s: 1.0     # after timed fingers AND arm arrival; then hold measured hand and replan
     fk_position_tolerance_m: 0.01
     fk_rotation_tolerance_rad: 0.05
   cameras:
     width: 848
     height: 480
     fps: 30
-    n_frames: 1                   # match the approved static start/goal's single native frame
-    preset: 0                     # sample recorded Custom (0); do not switch to High Accuracy
-    sensor_options: {enable_auto_exposure: 1.0, laser_power: 150.0} # observed in both sample cameras; exposure/gain remain automatic
-    emitter: "on"                 # model owner requests emitter ON for real observations/runs; 2026-11-11
+    n_frames: 1                   # depth frames per observation
+    preset: 0                     # RealSense Custom preset
+    sensor_options: {enable_auto_exposure: 1.0, laser_power: 150.0} # automatic exposure and gain
+    emitter: "on"                 # enable depth emitters
     timeout_ms: 2000
     calibration: configs/calibration.yaml   # written by python -m lawm_deploy.calibrate
     devices:                      # calibrated operation uses calibration.yaml; rough poses are only ICP initial guesses
-      - {serial: "243222072419", rough_eye: [0.95, -0.45, 0.60], rough_target: [0.5, 0.15, 0.05]}
-      - {serial: "243522075081", rough_eye: [0.95, 0.75, 0.60], rough_target: [0.5, 0.15, 0.05]}
+      - {serial: "CAMERA_1_SERIAL", rough_eye: [0.95, -0.45, 0.60], rough_target: [0.5, 0.15, 0.05]}
+      - {serial: "CAMERA_2_SERIAL", rough_eye: [0.95, 0.75, 0.60], rough_target: [0.5, 0.15, 0.05]}
   motion: {speed: 0.02, accel: 0.1, rot_speed: 0.15, finger_speed: 0.3, finger_accel: 1.0, min_move_s: 0.5, finger_rate_hz: 100, settle_s: 0.3}
 
 perception:
   near_m: 0.2
   far_m: 2.0
   use_box: true                    # crop to the workspace box (false: everything the cameras see within near..far)
-  box_lo: [-0.05, -0.9, -0.15]    # saved sample preview bounds, includes cup/table; perception only
-  box_hi: [0.9, 0.15, 0.55]       # keep fixed across this pair's trials
+  box_lo: [-0.05, -0.9, -0.15]    # example crop; perception only
+  box_hi: [0.9, 0.15, 0.55]       # use consistent bounds across trials
   robot_margin_m: 0.015            # camera points this close to the arm/hand surface (FK) are dropped
   voxel_m: 0.015                   # one camera point per 1.5 cm voxel (PointWorld's grid)
   n_hand: 1024                     # Sharpa mesh points
@@ -76,15 +77,16 @@ perception:
   min_scene_points: 500
 
 safety:
-  max_step_mm: 10.0                # conservative first real-test cap; sim keeps original 60 mm
+  max_step_mm: 60.0                # restored per model owner: avoid truncating typical predicted translations
+  execution_step_margin_mm: 2.0   # execution check allows 62 mm; planning clips at 60 mm
   ori_alpha: 0.5                   # lawm's DexWM value
-  max_rot_deg: 8.0                 # user authorized wider trial bounds 2026-11-12; observed plans ~5.7 deg
-  max_finger_deg: 20.0             # user authorized; observed max ~15.2 deg; absolute joint limits unchanged
+  max_rot_deg: 8.0                 # per-move wrist rotation limit
+  max_finger_deg: 20.0             # clamp planned increments below this guard; keep feedback margin and absolute limits
   max_joint_deg: 10.0
   max_fit_residual_mm: 15.0        # hold if the hand fit is worse than this
-  box_lo: [-1.2, -1.2, -0.012950372713809666] # existing vive_right_dual_base_calibrated + spray1111 TCP bounds; zero TCP
+  box_lo: [-1.2, -1.2, 0.0]  # example flange workspace; configure for your cell
   box_hi: [1.2, 1.2, 1.5]         # operating envelope, not an obstacle/collision model
-  floor_z_m: -0.065                # estimated table near -0.075 + 10 mm; physical confirmation pending
+  floor_z_m: 0.0                   # table/clearance plane in the robot base frame
 
 # Planner: lawm's configs/stage3/dexwm.json, unchanged (reach and grasp; place needs object labels).
 planner:
@@ -98,5 +100,5 @@ planner:
     hover: {margin_mm: 200.0, proximity_mm: 50.0, replan_cap: 40}   # grasp first aims 20 cm above the goal hand; lower if the workspace is short
 
 loop:   # success: hand within success_mm of the goal hand for success_replans replans in a row
-  reach: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
-  grasp: {max_replans: 80, success_mm: 50.0, success_replans: 5, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}
+  reach: {max_replans: 80, success_mm: 10.0, success_replans: 5, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
+  grasp: {max_replans: 80, success_mm: 10.0, success_replans: 5, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}

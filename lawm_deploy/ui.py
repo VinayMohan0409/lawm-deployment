@@ -11,6 +11,7 @@ import numpy as np
 import viser
 
 from lawm.sim.costs import SEG_HAND
+from lawm_deploy.session import TASKS
 
 GRAY, BLUE, GREEN, ORANGE, YELLOW, RED, PURPLE = (150, 150, 150), (30, 110, 220), (40, 170, 70), (240, 140, 20), (230, 200, 0), (220, 40, 40), (150, 60, 200)
 LEGEND = ("**Colours:** blue = hand now (joint angles + mesh), green = goal hand, purple = start hand, orange = hand after the planned move, "
@@ -64,13 +65,13 @@ class App:
             gui.add_button("Save box to config").on_click(lambda _: self.save())
             self.counts = gui.add_markdown("")
         if getattr(session.cell, "read_only", False):
-            gui.add_markdown("**Read-only:** Plan only is available. No UR control script or hand targets. Controller IK is not checked. Restart with --execute only after site commissioning.")
+            gui.add_markdown("**Read-only:** Plan only is available. Controller IK is not checked. Restart with --trial-run to enable execution.")
         trial_step = getattr(session.cell, 'trial_step', False)
         if trial_step:
-            gui.add_markdown('**Single-step trial:** existing setup accepted for this test; physical checks remain unverified. Step permits one move attempt. Run and manual jog are disabled.')
+            gui.add_markdown('**Single step:** one move attempt. Run and manual jog are disabled.')
         trial_run = getattr(session.cell, 'trial_run', False)
         if trial_run:
-            gui.add_markdown('**Closed-loop trial:** Run observes, plans and executes one move repeatedly. Stop ends the run. Existing setup is accepted for this test; physical checks remain unverified.')
+            gui.add_markdown('**Closed-loop run:** Run repeats planning and execution. Stop ends the run.')
         if hasattr(session.cell, "freedrive") and not getattr(session.cell, "read_only", False) and not (trial_step or trial_run):
             with gui.add_folder("Arrange the robot"):
                 gui.add_markdown("**Teleoperation:** release disconnects the UR controller and Sharpa SDK. Stop teleop and take control back before captures; simultaneous Sharpa readers are not assumed.  \n"
@@ -89,9 +90,12 @@ class App:
             self.show_start = gui.add_checkbox("Show start hand", True)
             self.captured = gui.add_markdown(
                 "Saved goal/start loaded. Start is a reference; every run observes the robot and scene again. No automatic return to start."
-                if session.goal is not None and session.start is not None else "Goal: none. Start: none.")
+                if session.goal is not None and session.start is not None else
+                "Saved goal loaded. Arrange the start scene, then Capture start and Run."
+                if session.goal is not None else "Goal: none. Start: none.")
         with gui.add_folder("3. Run"):
-            self.task = gui.add_dropdown("Task", ("reach", "grasp"), initial_value=session.cfg.get('experiment', {}).get('task', 'reach'))
+            gui.add_markdown(f"Run: up to **{session.execute_steps}** successive predicted targets per inference. Step always replans for one move.")
+            self.task = gui.add_dropdown("Task", TASKS, initial_value=session.cfg.get('experiment', {}).get('task', 'reach'))
             gui.add_button("Plan only (no motion)").on_click(lambda _: self.background(self.plan_only))
             gui.add_button("Step (one move)").on_click(lambda _: self.background(self.one_step))
             gui.add_button("Run", disabled=trial_step).on_click(lambda _: self.background(self.run))
@@ -231,7 +235,7 @@ class App:
                 self.status.content = 'Single-step trial: Run is disabled; only one move attempt per launch. Review the saved result before restarting.'
                 return False
         if execute and getattr(self.session.cell, "read_only", False):
-            self.status.content = "Read-only: use Plan only. Execution requires --execute and completed site checks."
+            self.status.content = "Read-only: use Plan only, or restart with --trial-run to execute."
             return False
         if getattr(self.session.cell, "released", False):
             self.status.content = "The robot is released (Teleoperation mode): untick it first."
@@ -256,9 +260,18 @@ class App:
             self.video_frame.image = self.sim.frame
             self.video_path.content = f"Recording to `{self.session.run_dir / 'video.mp4'}` (complete when the run ends)."
         what = "planned only (no motion)" if record.get("plan_only") else "moved" if record["moved"] else "held"
-        self.status.content = (f"Replan {record['replan']}: distance {record['distance_mm']:.1f} mm, {what}"
-                               f"{' (' + record['hold'] + ')' if record['hold'] else ''}, fit {record['fit_residual_mm']:.1f} mm, within {self.session.loop.success_mm:.0f} mm of the goal for {record['within_success']}/{self.session.loop.success_replans} replans."
-                               f"{' **Stop: ' + record['stop'] + '**' if record['stop'] else ''}")
+        self.status.content = (f"Step {record['replan']}: distance {record['distance_mm']:.1f} mm, {what}"
+                               f"{' (' + record['hold'] + ')' if record['hold'] else ''}, fit {record['fit_residual_mm']:.1f} mm, within {self.session.loop.success_mm:.0f} mm of the goal for {record['within_success']}/{self.session.loop.success_replans} step checks."
+                               f"{' **Stop: ' + record['stop'] + '**' if record['stop'] else ''}"
+                               f"  \nModel plan {record.get('planning_call', '?')}, target {record.get('predicted_step', 1)}/{record.get('execute_steps', 1)}.")
+        if record.get('finger_step_limited'):
+            self.status.content += (f"  \nFinger step limited: {record['requested_finger_step_deg']:.1f}° → "
+                                    f"{record['commanded_finger_step_deg']:.1f}°. Next move replans.")
+        if record.get('partial_motion'):
+            arrival = record['motion_result']['arrival']
+            self.status.content += (f"  \nHand target not reached: {arrival['worst_hand_joint']}, "
+                                    f"error {arrival['hand_error_deg']:.1f}°. Holding measured hand pose; "
+                                    "next move uses a fresh plan.")
 
     def plan_only(self):
         """One plan without motion; the orange hand shows where it would move."""
