@@ -11,6 +11,7 @@ import numpy as np
 import viser
 
 from lawm.sim.costs import SEG_HAND
+from lawm_deploy.config import execution_steps
 from lawm_deploy.session import TASKS
 
 GRAY, BLUE, GREEN, ORANGE, YELLOW, RED, PURPLE = (150, 150, 150), (30, 110, 220), (40, 170, 70), (240, 140, 20), (230, 200, 0), (220, 40, 40), (150, 60, 200)
@@ -18,7 +19,7 @@ LEGEND = ("**Colours:** blue = hand now (joint angles + mesh), green = goal hand
           "gray = camera scene (model input), red = raw camera points (overlay check), yellow = workspace box.")
 FLEX = ("FE", "PIP", "DIP", "IP")  # Sharpa joints that curl a finger (the sim jog closes these)
 SIM_PRESETS = {  # flange offset from home (m), finger closure, arrange directly; the grasp wraps the red cube of configs/sim.yaml
-    "reach": ((0.06, -0.06, -0.12), 0.3, False),
+    "push": ((0.06, -0.06, -0.12), 0.3, False),
     "grasp": ((0.013, 0.033, -0.342), 0.5, True),
 }
 
@@ -84,6 +85,7 @@ class App:
                 gui.add_button("Set fingers").on_click(lambda _: self.background(self.set_fingers))
         with gui.add_folder("2. Goal, then start"):
             gui.add_button("Capture goal").on_click(lambda _: self.background(lambda: self.capture("goal")))
+            gui.add_button("Capture lift goal (grasp_lift only)").on_click(lambda _: self.background(lambda: self.capture("goal_lift")))
             gui.add_button("Capture start").on_click(lambda _: self.background(lambda: self.capture("start")))
             self.show_goal = gui.add_checkbox("Show goal hand", True)
             self.show_goal_scene = gui.add_checkbox("Show goal scene", False)
@@ -94,8 +96,9 @@ class App:
                 "Saved goal loaded. Arrange the start scene, then Capture start and Run."
                 if session.goal is not None else "Goal: none. Start: none.")
         with gui.add_folder("3. Run"):
-            gui.add_markdown(f"Run: up to **{session.execute_steps}** successive predicted targets per inference. Step always replans for one move.")
-            self.task = gui.add_dropdown("Task", TASKS, initial_value=session.cfg.get('experiment', {}).get('task', 'reach'))
+            gui.add_markdown("Run: successive predicted targets per inference: " + ", ".join(f"{t} **{execution_steps(session.cfg, t)}**" for t in TASKS)
+                             + ". Step always replans for one move.")
+            self.task = gui.add_dropdown("Task", TASKS, initial_value=session.cfg.get('experiment', {}).get('task', 'push'))
             gui.add_button("Plan only (no motion)").on_click(lambda _: self.background(self.plan_only))
             gui.add_button("Step (one move)").on_click(lambda _: self.background(self.one_step))
             gui.add_button("Run", disabled=trial_step).on_click(lambda _: self.background(self.run))
@@ -185,7 +188,8 @@ class App:
         getattr(self.session, f"capture_{which}")()
         self.task_ready = None
         g, s = self.session.goal is not None, self.session.start is not None
-        self.captured.content = f"Goal: {'captured' if g else 'none'}. Start: {'captured' if s else 'none'}. Log: `{self.session.log}`"
+        lift = " Lift goal: captured." if self.session.goal_lift is not None else ""
+        self.captured.content = f"Goal: {'captured' if g else 'none'}.{lift} Start: {'captured' if s else 'none'}. Log: `{self.session.log}`"
         self.draw_goal()
         self.draw_start()
         self.draw("/current", getattr(self.session, which), BLUE, GRAY)

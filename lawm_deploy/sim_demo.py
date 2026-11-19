@@ -40,7 +40,7 @@ def main():
     """Capture the example goal, return to home, capture the start, Run, print each replan."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=str(config.REPO / "configs/sim.yaml"))
-    parser.add_argument("--task", choices=sorted(SIM_PRESETS), default="reach")
+    parser.add_argument("--task", choices=sorted(SIM_PRESETS), default="push")
     parser.add_argument("--standin", action="store_true")
     args = parser.parse_args()
     cfg = config.load(args.config)

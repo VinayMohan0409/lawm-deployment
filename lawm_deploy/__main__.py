@@ -23,6 +23,7 @@ def main(argv=None):
     samples.add_argument("--sample-pair", help="saved static start/goal directory; defaults to experiment.sample_pair")
     samples.add_argument("--no-sample-pair", action="store_true", help="capture a new goal/start instead")
     samples.add_argument("--goal", help="goal.npz, captured goal directory, or original static goal directory")
+    parser.add_argument("--goal-lift", help="grasp_lift only: the second goal (object held and lifted), same formats as --goal")
     parser.add_argument("--capture-goal", metavar="DIRECTORY", help="read-only goal capture into a new directory, then exit; no model inference")
     parser.add_argument("--restore", nargs="?", const="", metavar="PRESET_JSON",
                         help="restore UR using collection's saved preset (or specified JSON); alone exits, with --trial-run restores before opening the UI")
@@ -39,6 +40,8 @@ def main(argv=None):
     restore_options = {'open_hand': True} if args.open_hand else {}
     if args.execute_steps is not None:
         cfg.setdefault('experiment', {})['execute_steps'] = args.execute_steps
+        for task_loop in cfg.get('loop', {}).values():  # the command line overrides the per-task values too
+            task_loop.pop('execute_steps', None)
     config.execution_steps(cfg)
     execute = args.execute or args.trial_step or args.trial_run
     if args.capture_goal and (execute or args.restore is not None or args.observe_only or args.goal or args.sample_pair):
@@ -66,6 +69,12 @@ def main(argv=None):
         goal_path = config.repo_path(args.goal).resolve()
         cfg.setdefault('experiment', {}).update(goal=str(goal_path), sample_pair=None)
         goal = prepare_goal(goal_path, cfg)
+    goal_lift = None
+    if args.goal_lift:
+        if not args.goal:
+            parser.error('--goal-lift needs --goal')
+        goal_lift = prepare_goal(config.repo_path(args.goal_lift).resolve(), cfg)
+        cfg['experiment']['goal_lift'] = str(config.repo_path(args.goal_lift).resolve())
     if args.observe_only:
         from lawm_deploy.preflight import observe
         observe(cfg, cameras=True)
@@ -104,6 +113,9 @@ def main(argv=None):
         if goal is not None:
             from lawm_deploy.goals import install_goal
             install_goal(session, goal)
+        if goal_lift is not None:
+            session.goal_lift = goal_lift
+            session.save('goal_lift', goal_lift)
         app = App(session, args.config, args.port, cell if cfg["cell"]["type"] == "sim" else None)
         app.serve()
     except KeyboardInterrupt:

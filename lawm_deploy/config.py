@@ -22,9 +22,11 @@ def repo_path(p):
     return path if path.is_absolute() else REPO / path
 
 
-def execution_steps(cfg):
-    """Number of successive predicted targets consumed by Run per model call."""
+def execution_steps(cfg, task=None):
+    """Number of successive predicted targets consumed by Run per model call: loop.<task>.execute_steps, else experiment.execute_steps, else 1."""
     value = cfg.get('experiment', {}).get('execute_steps', 1)
+    if task is not None and cfg.get('loop', {}).get(task, {}).get('execute_steps') is not None:
+        value = cfg['loop'][task]['execute_steps']
     if type(value) is not int or not 1 <= value <= 5:
         raise ValueError('experiment.execute_steps must be an integer from 1 to 5')
     return value

@@ -64,7 +64,7 @@ def test_reach_runs_and_logs(cell, tmp_path):
     s.capture_goal()
     cell.move(home, np.zeros(22))
     s.capture_start()
-    s.begin("reach")
+    s.begin("push")
     first = s.step()["distance_mm"]
     for _ in range(5):
         record = s.step()
@@ -101,7 +101,7 @@ def started(cell, tmp_path):
 def test_step_after_robot_moved_uses_fresh_state(cell, tmp_path):
     """If the robot moved after the start was captured, the step plans from where it is: the flange moves at most max_step_mm."""
     s, home = started(cell, tmp_path)
-    s.begin("reach")
+    s.begin("push")
     away = home.copy()
     away[:3, 3] += [0.0, 0.2, 0.05]
     cell.move(away, np.zeros(22))
@@ -114,7 +114,7 @@ def test_step_after_robot_moved_uses_fresh_state(cell, tmp_path):
 def test_each_run_is_new_and_plan_only_changes_nothing(cell, tmp_path):
     """Plan only leaves the run's counters and logs alone; a second begin starts a fresh run in its own folder."""
     s, _ = started(cell, tmp_path)
-    s.begin("reach")
+    s.begin("push")
     first_dir = s.run_dir
     s.step(execute=False)
     assert s.replan == 0 and s.records == [] and not list(first_dir.glob("replan_*.npz"))
@@ -128,14 +128,14 @@ def test_each_run_is_new_and_plan_only_changes_nothing(cell, tmp_path):
     with np.load(first_dir / 'replan_000.npz') as saved:
         assert saved['q_arm_ik'].shape == (6,)
     assert json.loads((first_dir / 'status.json').read_text())['replans'] == 1
-    s.begin("reach")
+    s.begin("push")
     assert s.run_dir != first_dir and s.replan == 0 and s.records == [] and not s.finished
 
 
 @pytest.mark.parametrize('stage', ['plan', 'fit', 'ik_and_checks', 'move', 'observe_after'])
 def test_failed_step_retains_inputs_prediction_and_error_stage(cell, tmp_path, monkeypatch, stage):
     s, _ = started(cell, tmp_path)
-    s.begin('reach')
+    s.begin('push')
     def fail(*args, **kwargs):
         raise RuntimeError('injected failure at ' + stage)
     if stage == 'plan': monkeypatch.setattr(s.planner, 'plan', fail)
@@ -159,8 +159,8 @@ def test_single_step_success_finalizes_without_run(cell, tmp_path):
     s = Session(cell, CFG, StandInModel(), tmp_path)
     s.capture_goal()
     s.capture_start()
-    s.cfg = dict(s.cfg, loop=dict(s.cfg['loop'], reach=dict(s.cfg['loop']['reach'], success_replans=1)))
-    s.begin('reach')
+    s.cfg = dict(s.cfg, loop=dict(s.cfg['loop'], push=dict(s.cfg['loop']['push'], success_replans=1)))
+    s.begin('push')
     assert s.step()['stop'] == 'success'
     status = json.loads((s.run_dir / 'status.json').read_text())
     assert status['loop_ended'] and status['hand_goal_reached'] and status['replans'] == 1
@@ -170,7 +170,7 @@ def test_single_step_success_finalizes_without_run(cell, tmp_path):
 def test_translation_rejection_holds_then_replans(cell, tmp_path, monkeypatch):
     from lawm_deploy.hardware_contract import StepTranslationRejected
     s, _ = started(cell, tmp_path)
-    s.begin('reach')
+    s.begin('push')
     move = cell.move
     initial_rotation = s.executor.last_rotvec.copy()
     def reject(*args):
@@ -219,8 +219,8 @@ def chunk_session(cell, tmp_path, monkeypatch):
     from types import SimpleNamespace
     from dataclasses import replace
     s, _ = started(cell, tmp_path)
+    s.begin('push')
     s.execute_steps = 3
-    s.begin('reach')
     s.loop = replace(s.loop, max_replans=4, success_replans=99)
     calls = []
     def plan(coords, replan):

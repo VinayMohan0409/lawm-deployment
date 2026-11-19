@@ -17,7 +17,7 @@ from lawm_deploy.observation_io import save_observation
 from lawm.sim.control import StallDetector
 from lawm.sim.costs import SEG_HAND
 from lawm.sim.dexwm.planning.cem_replan import CemSettings
-from lawm.sim.dexwm.planning.phase_gates import GateSettings, HoverSettings
+from lawm.sim.dexwm.planning.phase_gates import GateSettings
 from lawm.sim.dexwm.planning.plan_costs import CostWeights
 from lawm.sim.dexwm.planning.task_planner import TaskPlanner
 
@@ -27,7 +27,14 @@ from lawm_deploy.perception import Perception, PerceptionSettings
 from lawm_deploy.robot_model import RobotModel, ARM_JOINTS
 from lawm_deploy.safety import Executor, SafetySettings, check, limit_finger_step
 
-TASKS = ("reach", "grasp")  # place needs object labels, which real camera clouds do not have
+# task -> (lawm planner task, number of hand goals). Every task uses the hand only: the planner minimises the distance of the
+# predicted hand points to the goal hand points (lawm's "reach" planner: no object terms, no hover gate).
+TASK_SPECS = {
+    "push": ("reach", 1),         # start hand -> goal hand after the push
+    "grasp": ("reach", 1),        # start hand -> hand closed around the object
+    "grasp_lift": ("reach", 2),   # grasp hand, then the lifted hand (a second captured goal)
+}
+TASKS = tuple(TASK_SPECS)
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,17 @@ class LoopSettings:
     stall_patience: int | None
     stall_tol_mm: float
     max_holds: int
+    execute_steps: int | None = None  # predicted targets Run executes per model call for this task (None: experiment.execute_steps)
+    stage_mm: float = 20.0      # grasp_lift: the next goal takes over once the hand is this close to the current one
+    stage_replans: int = 2      # for this many replans in a row
+    # Fingers: "model" = the angles fitted to the model's predicted hand; "goal" = the goal hand's captured angles, blended in as the
+    # commanded palm comes within finger_far_mm of the goal palm and fully at finger_close_mm (the model still plans the hand pose;
+    # the original checkpoint does not curl the Sharpa fingers on its own)
+    finger_source: str = "model"
+    finger_far_mm: float = 60.0
+    finger_close_mm: float = 20.0
+    finger_squeeze_deg: float = 0.0  # once fully blended, close this much past the goal angles (on joints that close by > 10 deg) to grip:
+    # goal angles are recorded with the fingers resting on the object, so commanding exactly them squeezes nothing
 
 
 @dataclass
@@ -68,7 +86,7 @@ def planner_settings(cfg, task):
     """lawm's search, cost-weight and gate settings of a task from the config."""
     p = cfg["planner"]
     weights = CostWeights(**p["weights"][task])
-    return CemSettings(**p["cem"][task]), weights, GateSettings(HoverSettings(**p["gates"]["hover"]), None)  # the secure gate is place only
+    return CemSettings(**p["cem"][task]), weights, GateSettings(None, None)  # no hover (lawm grasp only) or secure (place only) gate
 
 
 class Session:
@@ -92,6 +110,7 @@ class Session:
         self.log = Path(log_root) if capture_only else Path(log_root) / f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
         self.log.mkdir(parents=True, exist_ok=not capture_only)
         self.goal = self.start = self.current = self.planner = self.last_plan = self.run_dir = None
+        self.goal_lift, self.stage = None, 0
         self.task, self.replan, self.holds, self.records, self.finished = None, 0, 0, [], True
 
     def observe(self):
@@ -160,6 +179,24 @@ class Session:
             self.cell.set_markers(self.goal.coords[self.goal.segment == SEG_HAND])
         return self.goal
 
+    def capture_goal_lift(self):
+        """Observe and keep it as the second goal of grasp_lift (the object held, lifted)."""
+        self.goal_lift = self.observe()
+        self.save("goal_lift", self.goal_lift)
+        return self.goal_lift
+
+    def goals(self, task=None):
+        """The hand goals of a task, in order."""
+        n = TASK_SPECS[task or self.task][1]
+        return [self.goal, self.goal_lift][:n]
+
+    def stage_planner(self, stage):
+        """lawm's planner towards the hand goal of a stage."""
+        goal = self.goals()[stage]
+        lawm_task = TASK_SPECS[self.task][0]
+        cem, weights, gates = planner_settings(self.cfg, self.task)
+        return TaskPlanner(lawm_task, goal.coords, goal.segment, self.hand.finger_mask, self.model, self.seed + stage, cem, weights, gates)
+
     def capture_start(self):
         """Observe and keep it as the start."""
         self.start = self.current = self.observe()
@@ -181,14 +218,18 @@ class Session:
         """Start a run of a task towards the captured goal from the robot as it is now, in a new run folder (goal, captured start, run start)."""
         assert task in TASKS, task
         assert self.goal is not None and self.start is not None, "capture the goal, then the start"
+        assert all(g is not None for g in self.goals(task)), "grasp_lift needs the lift goal too (capture it after the grasp goal)"
         if self.run_dir is not None and not self.finished:
             self.finish("superseded by new run")
         self.current = self.observe()
-        cem, weights, gates = planner_settings(self.cfg, task)
         seed = int(np.random.SeedSequence([self.cfg["seed"], TASKS.index(task), int(time.time())]).generate_state(1)[0])
-        self.planner = TaskPlanner(task, self.goal.coords, self.goal.segment, self.hand.finger_mask, self.model, seed, cem, weights, gates)
+        self.task, self.seed, self.stage, self.stage_within = task, seed, 0, 0
+        self.planner = self.stage_planner(0)
         self.executor = Executor(self.safety, self.current.flange)
         self.loop = LoopSettings(**self.cfg["loop"][task])
+        assert self.loop.finger_source in ("model", "goal"), self.loop.finger_source
+        self.execute_steps = execution_steps(self.cfg, task)
+        self.start_fingers = self.current.q_hand.copy()
         self.stall = None if self.loop.stall_patience is None else StallDetector(self.loop.stall_patience, self.loop.stall_tol_mm)
         self.task, self.replan, self.holds, self.within, self.records, self.finished, self.plan_only_count = task, 0, 0, 0, [], False, 0
         self.pending_plan, self.planning_calls = None, 0
@@ -198,8 +239,11 @@ class Session:
             hardware_log=str(getattr(self.cell, "log_path", "")),
             arm_joint_names=list(ARM_JOINTS), hand_joint_names=self.robot.hand_joint_names,
             provenance=self.provenance, initial_hand_distance_mm=task_distance_mm(self.current, self.goal),
-            success_definition="hand_mean_point_distance_only; grasp success requires separate assessment"), indent=1))
+            lawm_planner_task=TASK_SPECS[task][0], n_goals=TASK_SPECS[task][1],
+            success_definition="hand_mean_point_distance_only (last goal); grasp success requires separate assessment"), indent=1))
         self.save("goal", self.goal, self.run_dir)
+        if TASK_SPECS[task][1] > 1:
+            self.save("goal_lift", self.goal_lift, self.run_dir)
         self.save("start", self.start, self.run_dir)
         self.save("run_start", self.current, self.run_dir)
         if hasattr(self.cell, "start_recording"):  # simulated cell: record the run
@@ -286,6 +330,20 @@ class Session:
         self._stage = 'fit'
         rot, pos, q, fit = self.hand.fit(hand_target, obs.q_hand)
         target, fingers, move_mm = self.executor.command(rot, pos, q, obs.root, obs.flange)
+        if self.loop.finger_source == "goal":
+            goal = self.goals()[self.stage]
+            palm_mm = float(np.linalg.norm((target @ self.robot.root_in_flange)[:3, 3] - goal.root[:3, 3]) * 1000)
+            span = max(self.loop.finger_far_mm - self.loop.finger_close_mm, 1e-6)
+            blend = float(np.clip((self.loop.finger_far_mm - palm_mm) / span, 0.0, 1.0))
+            # from the previous stage's goal fingers (the start's at stage 0): after the grasp the fingers stay closed while the hand lifts
+            prev = self.start_fingers if self.stage == 0 else self.goals()[self.stage - 1].q_hand
+            fingers = prev + blend * (goal.q_hand - prev)
+            if (blend >= 1.0 or self.stage > 0) and self.loop.finger_squeeze_deg > 0:
+                closing = goal.q_hand - self.start_fingers
+                squeeze = np.where(np.abs(closing) > np.radians(10), np.sign(closing) * np.radians(self.loop.finger_squeeze_deg), 0.0)
+                lo, hi = self.robot.hand_limits[:, 0], self.robot.hand_limits[:, 1]
+                fingers = np.clip(fingers + squeeze, lo, hi)
+            metadata.update(finger_source="goal", finger_blend=blend, palm_to_goal_mm=palm_mm)
         requested_fingers = fingers.copy()
         margin = self.cfg['cell'].get('guards', {}).get('hand_feedback_limit_tolerance_deg', 0.0)
         fingers, finger_limits = limit_finger_step(fingers, obs.q_hand, self.robot.hand_limits,
@@ -313,7 +371,7 @@ class Session:
                    unclipped_command_mm=move_mm, **metadata)
         if not execute:
             self.plan_only_count += 1
-            record = dict(replan=self.replan, distance_mm=task_distance_mm(obs, self.goal), moved=False, hold=hold, executed=plan.executed, plan_cost=plan.cost,
+            record = dict(replan=self.replan, stage=self.stage, distance_mm=task_distance_mm(obs, self.goals()[self.stage]), moved=False, hold=hold, executed=plan.executed, plan_cost=plan.cost,
                         predicted_error_mm=plan.final_hand_error_mm, commanded_mm=commanded_mm,
                         unclipped_command_mm=move_mm, planning_elapsed_s=planning_elapsed_s,
                         fit_residual_mm=fit["mean_residual_mm"], phase_changed=False,
@@ -345,8 +403,17 @@ class Session:
         self.save(f'after_{stem}', new, self.run_dir)
         self._stage = 'record'
         phase = bool(self.planner.update(new.coords, self.replan))
-        dist = task_distance_mm(new, self.goal)
-        record = dict(replan=self.replan, distance_mm=dist, moved=moved, hold=hold, executed=plan.executed, plan_cost=plan.cost,
+        stage = self.stage
+        dist = task_distance_mm(new, self.goals()[stage])
+        last_stage = stage == len(self.goals()) - 1
+        if not last_stage:
+            self.stage_within = self.stage_within + 1 if dist < self.loop.stage_mm else 0
+            if self.stage_within >= self.loop.stage_replans:  # the next goal takes over
+                self.stage, self.stage_within, phase = stage + 1, 0, True
+                self.planner = self.stage_planner(self.stage)
+                if self.loop.stall_patience is not None:
+                    self.stall = StallDetector(self.loop.stall_patience, self.loop.stall_tol_mm)
+        record = dict(replan=self.replan, stage=stage, distance_mm=dist, moved=moved, hold=hold, executed=plan.executed, plan_cost=plan.cost,
                       predicted_error_mm=plan.final_hand_error_mm, commanded_mm=commanded_mm,
                       unclipped_command_mm=move_mm, planning_elapsed_s=planning_elapsed_s,
                       fit_residual_mm=fit["mean_residual_mm"], phase_changed=phase,
@@ -354,7 +421,7 @@ class Session:
                       partial_motion=partial_motion,
                       success_definition="hand_mean_point_distance_only; not grasp success", **metadata)
         self.current, self.replan = new, self.replan + 1
-        self.within = self.within + 1 if dist < self.loop.success_mm else 0
+        self.within = self.within + 1 if last_stage and dist < self.loop.success_mm else 0
         record["within_success"] = self.within
         record["stop"] = ("success" if self.within >= self.loop.success_replans else "too many holds" if self.holds >= self.loop.max_holds
                           else "stalled" if moved and self.stall and self.stall.update(dist) else "max replans" if self.replan >= self.loop.max_replans else None)

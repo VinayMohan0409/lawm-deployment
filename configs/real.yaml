@@ -4,8 +4,8 @@ log_dir: runs  # use local storage for the control-loop journal
 
 experiment:
   sample_pair: null
-  task: reach                     # reach or grasp
-  execute_steps: 1                 # Run: successive targets per inference; --execute-steps overrides (1..5)
+  task: push                      # push, grasp or grasp_lift
+  execute_steps: 1                 # Run: successive targets per inference, unless loop.<task>.execute_steps is set; --execute-steps overrides both (1..5)
 
 # Reuse the same saved pose and restore implementation as data collection.
 restore:
@@ -88,17 +88,19 @@ safety:
   box_hi: [1.2, 1.2, 1.5]         # operating envelope, not an obstacle/collision model
   floor_z_m: 0.0                   # table/clearance plane in the robot base frame
 
-# Planner: lawm's configs/stage3/dexwm.json, unchanged (reach and grasp; place needs object labels).
+# Planner: lawm's DexWM planner (configs/stage3/dexwm.json search budget). Every task scores the hand only.
 planner:
   cem:
-    reach: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
+    push: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
     grasp: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
+    grasp_lift: {pop: 64, iters: 4, elite_frac: 0.2, min_std: 0.05, hold_candidate: true}
   weights:
-    reach: {hand_scale: 1.0, fingertip: 2.0, object_still: 1.0}
+    # push, grasp, grasp_lift: the hand only (predicted hand points to the goal hand points, finger points x2)
+    push: {hand_scale: 1.0, fingertip: 2.0}
     grasp: {hand_scale: 1.0, fingertip: 2.0}
-  gates:
-    hover: {margin_mm: 200.0, proximity_mm: 50.0, replan_cap: 40}   # grasp first aims 20 cm above the goal hand; lower if the workspace is short
+    grasp_lift: {hand_scale: 1.0, fingertip: 2.0}
 
 loop:   # success: hand within success_mm of the goal hand for success_replans replans in a row
-  reach: {max_replans: 80, success_mm: 10.0, success_replans: 5, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
-  grasp: {max_replans: 80, success_mm: 10.0, success_replans: 5, stall_patience: null, stall_tol_mm: 0.05, max_holds: 5}
+  push: {max_replans: 80, execute_steps: 5, success_mm: 30.0, success_replans: 3, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5}
+  grasp: {max_replans: 80, execute_steps: 3, success_mm: 20.0, success_replans: 3, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5, finger_source: goal, finger_far_mm: 60.0, finger_close_mm: 20.0, finger_squeeze_deg: 10.0}
+  grasp_lift: {max_replans: 80, execute_steps: 3, success_mm: 20.0, success_replans: 3, stall_patience: 15, stall_tol_mm: 0.05, max_holds: 5, stage_mm: 20.0, stage_replans: 2, finger_source: goal, finger_far_mm: 60.0, finger_close_mm: 20.0, finger_squeeze_deg: 10.0}
